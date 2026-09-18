@@ -9,159 +9,96 @@ on:
 
 permissions:
   contents: read
+  actions: write        # dispatching argus-run.yml
   security-events: write
-  actions: read
   packages: read
   pull-requests: write
 
 # ============================================================================
-# Discover mode tests: container-scan.yml finds Dockerfiles in this repo
+# Discover mode tests: matrix over a parameter table, dispatch architecture.
 #
-# This repo has 3 Dockerfiles under tests/dockerfiles/:
-#   - good/Dockerfile      (FROM alpine:3.18 — builds and scans)
-#   - vulnerable/Dockerfile (FROM node:14-slim — builds, has CVEs)
-#   - broken/Dockerfile    (FROM nonexistent — fails to pull/build)
+# max-parallel: 1 is load-bearing, not tuning. These previously ran as a needs
+# chain (D2 needs D1, D3 needs D2, D4 needs D3) purely to serialise discover
+# runs, which all build the same Dockerfiles under tests/. The matrix expresses
+# that directly, and drops the `if: always()` D4 needed to survive a
+# deliberately-failing D3 -- under dispatch D3 is green when it passes.
 #
-# The discover job uses: find . -name "Dockerfile*" -not -path "./.git/*"
-# So all 3 will be found. The broken one should fail gracefully.
+# D3 and D4 assert argus FAILS, and are green when it does.
 # ============================================================================
 
 jobs:
-  # --------------------------------------------------------------------------
-  # D1: Discover mixed Dockerfiles (good + vulnerable + broken)
-  # --------------------------------------------------------------------------
-  d1-discover-mixed:
-    name: "D1: discover mixed"
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy,grype
-      fail_on_severity: none
-      allow_failure: false
+  discover:
+    name: "${{ matrix.t.id }}: ${{ matrix.t.name }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        t:
+          - { id: D1, name: "discover mixed",           expect: success, scanners: "trivy,grype", sev: none,     allow: 'true'  }
+          - { id: D2, name: "discover trivy only",      expect: success, scanners: "trivy",       sev: none,     allow: 'true'  }
+          - { id: D3, name: "discover fail-closed",     expect: failure, scanners: "trivy,grype", sev: critical, allow: 'false' }
+          - { id: D4, name: "build gate (severity none)", expect: failure, scanners: "trivy",     sev: none,     allow: 'false' }
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-scan
+        with:
+          test_id: ${{ matrix.t.id }}
+          expect: ${{ matrix.t.expect }}
+          scan_mode: discover
+          scanners: ${{ matrix.t.scanners }}
+          fail_on_severity: ${{ matrix.t.sev }}
+          allow_failure: ${{ matrix.t.allow }}
+      - name: Record result
+        if: always()
+        run: |
+          jq -n -c --arg id "${{ matrix.t.id }}" \
+                   --arg status "${{ steps.t.outputs.status || 'FAIL' }}" \
+                   --arg child "${{ steps.t.outputs.child_run_id }}" \
+                   '{id:$id, status:$status, child:$child}' > "result-${{ matrix.t.id }}.json"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testresult-${{ matrix.t.id }}
+          path: result-${{ matrix.t.id }}.json
+          retention-days: 7
+          if-no-files-found: error
 
-  # --------------------------------------------------------------------------
-  # D2: Discover with trivy only
-  # --------------------------------------------------------------------------
-  d2-discover-trivy-only:
-    name: "D2: discover trivy only"
-    needs: d1-discover-mixed
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy
-      fail_on_severity: none
-      allow_failure: false
-
-  # --------------------------------------------------------------------------
-  # D3: Discover with severity threshold
-  # --------------------------------------------------------------------------
-  d3-discover-severity:
-    name: "D3: discover + severity"
-    needs: d2-discover-trivy-only
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy,grype
-      fail_on_severity: critical
-      allow_failure: false
-
-  # --------------------------------------------------------------------------
-  # Validation job
-  # --------------------------------------------------------------------------
   validate-results:
     name: "Validate Discover Test Results"
     runs-on: ubuntu-latest
+    needs: discover
+    if: always()
     outputs:
       results: ${{ steps.collect.outputs.results }}
-    needs:
-      - d1-discover-mixed
-      - d2-discover-trivy-only
-      - d3-discover-severity
-    if: always()
     steps:
-      - name: Validate test outcomes
-        env:
-          D1: ${{ needs.d1-discover-mixed.result }}
-          D2: ${{ needs.d2-discover-trivy-only.result }}
-          D3: ${{ needs.d3-discover-severity.result }}
-        run: |
-          FAILURES=0
-
-          check() {
-            local name="$1" got="$2" expected="$3"
-            if [ "$got" = "$expected" ]; then
-              echo "PASS $name: $got (expected $expected)"
-            else
-              echo "FAIL $name: $got (expected $expected)"
-              FAILURES=$((FAILURES + 1))
-            fi
-          }
-
-          echo "============================================"
-          echo "Discover Mode Test Validation"
-          echo "============================================"
-          echo ""
-
-          # D1: Should succeed (allow_failure handles broken build, continue-on-error on matrix)
-          check "D1 discover-mixed" "$D1" "success"
-
-          # D2: Should succeed (trivy only)
-          check "D2 discover-trivy-only" "$D2" "success"
-
-          # D3: May fail if vulnerable image has criticals
-          # Both success and failure are valid outcomes depending on node:14 CVEs
-          if [ "$D3" = "success" ] || [ "$D3" = "failure" ]; then
-            echo "PASS D3 discover-severity: $D3 (completed - threshold applied)"
-          else
-            echo "FAIL D3 discover-severity: $D3 (unexpected state)"
-            FAILURES=$((FAILURES + 1))
-          fi
-
-          echo ""
-          echo "============================================"
-          TOTAL=3
-          PASSED=$((TOTAL - FAILURES))
-          echo "Results: $PASSED/$TOTAL passed"
-          echo "============================================"
-
-          if [ "$FAILURES" -gt 0 ]; then
-            exit 1
-          fi
-
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: testresult-D*
+          path: ./results
+          merge-multiple: true
       - name: Build results JSON
         id: collect
-        if: always()
-        env:
-          D1: ${{ needs.d1-discover-mixed.result }}
-          D2: ${{ needs.d2-discover-trivy-only.result }}
-          D3: ${{ needs.d3-discover-severity.result }}
         run: |
-          to_status() {
-            local got="$1" expected="$2"
-            case "$got" in
-              skipped) echo "skip" ;;
-              cancelled) echo "cancel" ;;
-              *)
-                if [ "$got" = "$expected" ]; then
-                  echo "pass"
-                else
-                  echo "FAIL"
-                fi
-                ;;
-            esac
+          set -uo pipefail
+          cat > /tmp/detail.json <<'JSON'
+          {
+            "D1": ["discover mixed","Does argus complete a discover run over all three Dockerfiles when allow_failure is true?"],
+            "D2": ["discover trivy only","Does argus complete a discover run with trivy as the only scanner when allow_failure is true?"],
+            "D3": ["discover fail-closed","Does argus fail the workflow when a discover run hits both a broken build and criticals with allow_failure false?"],
+            "D4": ["build gate isolated","Does argus fail the workflow when a discovered Dockerfile does not build, even with the severity gate switched off?"]
           }
-          # D3 accepts both success and failure
-          D3_STATUS="pass"
-          if [ "$D3" != "success" ] && [ "$D3" != "failure" ]; then
-            D3_STATUS="FAIL"
-          fi
-          RESULTS=$(jq -n -c \
-            --arg d1 "$(to_status "$D1" success)" \
-            --arg d2 "$(to_status "$D2" success)" \
-            --arg d3 "$D3_STATUS" \
-            '[
-              {"id":"D1","name":"discover mixed","detail":"3 Dockerfiles (good+vulnerable+broken) with trivy,grype","status":$d1},
-              {"id":"D2","name":"discover trivy only","detail":"Dockerfile discovery with trivy scanner only","status":$d2},
-              {"id":"D3","name":"discover + severity","detail":"Dockerfile discovery with critical severity threshold","status":$d3}
-            ]')
+          JSON
+          RESULTS=$(jq -s -c --slurpfile d /tmp/detail.json '
+            # Filter by id rather than trusting the artifact glob. All suites share
+            # one workflow run, so a broad pattern pulls in results from other suites and
+            # tonumber then dies on a foreign id -- which is exactly how this failed.
+            [ .[] | select(.id | test("^D[0-9]+$")) | { id: .id, name: ($d[0][.id][0] // .id), detail: ($d[0][.id][1] // ""), status: .status } ]
+            | sort_by(.id | ltrimstr("D") | tonumber)
+          ' ./results/result-*.json)
+          echo "$RESULTS" | jq -e 'length > 0' >/dev/null || { echo "::error::no discover results collected"; exit 1; }
+          echo "collected $(echo "$RESULTS" | jq 'length') results"
           echo "results=$RESULTS" >> "$GITHUB_OUTPUT"
