@@ -96,22 +96,6 @@ runs:
           > /tmp/dispatch-inputs.json
         cat /tmp/dispatch-inputs.json
 
-        # Same retry as argus-scan: concurrent suite runs can exceed GitHub's
-        # secondary rate limit, and a single attempt turns a throttle into a
-        # red test that reads as an argus regression.
-        DISPATCHED=false
-        for attempt in 1 2 3 4 5; do
-          if gh workflow run "$WF" --ref "$GITHUB_REF_NAME" --json < /tmp/dispatch-inputs.json 2>/tmp/dispatch-err; then
-            DISPATCHED=true
-            break
-          fi
-          echo "::warning::dispatch attempt $attempt failed: $(tr '\n' ' ' < /tmp/dispatch-err | cut -c1-400)"
-          sleep $(( attempt * 15 + RANDOM % 10 ))
-        done
-        if [ "$DISPATCHED" != "true" ]; then
-          fail "Could not dispatch $WF after 5 attempts. Last error from gh: $(tr '\n' ' ' < /tmp/dispatch-err). Check that it exists on the DEFAULT branch, that this job has actions: write, and that every input value is a string."
-        fi
-
         # THE API BUDGET. github.token allows 1,000 REST requests per hour per
         # repository, shared by every job in the run. ~40 of these run at once;
         # at the old cadence (a lookup every 5s, then a status poll every 15s)
@@ -120,10 +104,13 @@ runs:
         # child runs that SUCCEEDED were reported as "did not finish" (runs
         # 35913556488 and 36006548670: 12 and 26 tests, all of them this).
         #
-        # So: poll about once a minute, and when a call is refused, ask when the
-        # budget resets (GET /rate_limit does not count against it), wait for
-        # that, and add the wait to the deadline -- a throttle is not the child
-        # taking too long.
+        # So: poll every ~100s, and when ANY call is refused -- the dispatch
+        # itself included -- ask when the budget resets (GET /rate_limit does not
+        # count against it), wait for that, and add the wait to the deadline: a
+        # throttle is not the child taking too long. The budget is per hour and
+        # shared by overlapping runs, so a run that starts while a cancelled one
+        # is still spending it (36022839257: C5 and R7 could not even dispatch)
+        # has to be able to wait rather than fail.
         throttle_wait() {
           local reset now wait
           reset=$(gh api rate_limit --jq '.resources.core | select(.remaining == 0) | .reset' 2>/dev/null || true)
@@ -136,6 +123,22 @@ runs:
           THROTTLED=$(( ${THROTTLED:-0} + wait ))
           return 0
         }
+
+        # Retried, because a single attempt turns a throttle into a red test
+        # that reads as an argus regression. A refused call waits for the
+        # budget to reset first instead of burning the next attempt seconds later.
+        DISPATCHED=false
+        for attempt in 1 2 3 4 5; do
+          if gh workflow run "$WF" --ref "$GITHUB_REF_NAME" --json < /tmp/dispatch-inputs.json 2>/tmp/dispatch-err; then
+            DISPATCHED=true
+            break
+          fi
+          echo "::warning::dispatch attempt $attempt failed: $(tr '\n' ' ' < /tmp/dispatch-err | cut -c1-400)"
+          throttle_wait || sleep $(( attempt * 15 + RANDOM % 10 ))
+        done
+        if [ "$DISPATCHED" != "true" ]; then
+          fail "Could not dispatch $WF after 5 attempts. Last error from gh: $(tr '\n' ' ' < /tmp/dispatch-err). Check that it exists on the DEFAULT branch, that this job has actions: write, and that every input value is a string."
+        fi
 
         RID=""
         for i in $(seq 1 30); do
@@ -155,9 +158,9 @@ runs:
 
         DEADLINE=$(( $(date +%s) + TIMEOUT_S ))
         STATUS=""; CONCL=""; SEEN=false; LASTERR=""
-        # A child takes minutes: the first look is after ~45s, then about once a
-        # minute with jitter so ~40 pollers do not fire together.
-        sleep 45
+        # A child takes minutes: the first look is after ~60s, then every ~100s
+        # with jitter so ~40 pollers do not fire together.
+        sleep 60
         while [ "$(date +%s)" -lt "$(( DEADLINE + ${THROTTLED:-0} ))" ]; do
           if OUT=$(gh run view "$RID" --json status,conclusion \
                      --jq '"\(.status) \(.conclusion // "-")"' 2>/tmp/poll-err); then
@@ -167,7 +170,7 @@ runs:
             LASTERR=$(tr '\n' ' ' < /tmp/poll-err | cut -c1-300)
             if throttle_wait; then continue; fi
           fi
-          sleep $(( 50 + RANDOM % 20 ))
+          sleep $(( 90 + RANDOM % 20 ))
         done
         if [ "$STATUS" != "completed" ]; then
           # Never having seen the child is a different failure from watching it
