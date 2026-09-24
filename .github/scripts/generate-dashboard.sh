@@ -245,16 +245,16 @@ for wf in test-unit test-actions-direct test-runtime-env test-remote test-discov
   # must degrade to "no catalog entries", not take the whole board down.
   [ -n "$part" ] || part='[]'
 
-  # Line number of each test's job definition, so a row links to the source that
-  # defines it instead of repeating the same run URL on every row. Job names look
-  # like `name: "R6: fail on critical"`; take the last match per id so E1 lands on
-  # the scan job rather than its digest-resolving helper.
-  locs=$(grep -nE '^ *name: "[A-Z]+[0-9]+[a-z]?:' "$f" 2>/dev/null \
-    | sed -E 's/^([0-9]+): *name: "([A-Z]+[0-9]+)[a-z]?:.*/{"id":"\2","line":\1}/' \
-    | jq -s -c 'group_by(.id) | map(max_by(.line))' 2>/dev/null) || locs='[]'
+  # Where each test is defined, as a line RANGE, so a row's "test" link opens
+  # GitHub with the whole block highlighted: the job for a test that is its own
+  # job, the row (and its annotations) for a matrix test. It used to be the
+  # job's `name:` line alone, and matrix tests had no line at all -- their link
+  # opened the top of the file. See test-locations.py.
+  locs=$(python3 "$SCRIPT_DIR/test-locations.py" "$f" 2>/dev/null) || locs='[]'
   [ -n "$locs" ] || locs='[]'
   part=$(jq -c -n --argjson p "$part" --argjson l "$locs" \
-    '($l | map({(.id): .line}) | add // {}) as $m | $p | map(. + {line: ($m[.id] // null)})')
+    '($l | map({(.id): {line, end}}) | add // {}) as $m
+     | $p | map(. + {line: ($m[.id].line // null), end: ($m[.id].end // null)})')
   if [ -n "$part" ]; then
     CATALOG_JSON=$(jq -c -n --argjson a "$CATALOG_JSON" --argjson b "$part" '$a + $b')
   else
@@ -931,7 +931,7 @@ __NAV_JS__
       reason: r ? (r.reason || '') : '',
       failclass: r ? (r.cls || '') : '',
       category: c.category || (r && r.category),
-      file: c.file || '', line: c.line || null, why: '', scope: c.scope || 'all',
+      file: c.file || '', line: c.line || null, end: c.end || null, why: '', scope: c.scope || 'all',
       checks: (r && r.checks) || c.checks || null,
       stats: (r && r.stats) || null
     });
@@ -1516,7 +1516,8 @@ __NAV_JS__
   function srcHref(x) {
     if (x.issue) return repoUrl + '/issues/' + x.issue;   // a gap points at its issue
     if (!x.file) return null;
-    return srcBase + x.file + (x.line ? '#L' + x.line : '');
+    // A range, so GitHub highlights the whole definition, not its first line.
+    return srcBase + x.file + (x.line ? '#L' + x.line + (x.end && x.end > x.line ? '-L' + x.end : '') : '');
   }
   function highlight(text, hits) {
     var html = esc(text);
@@ -1572,7 +1573,8 @@ __NAV_JS__
     // assert?" vs "what did it do on this run?" -- so they get their own columns.
     const href = srcHref(x);
     const defCell = href
-      ? '<a href="' + href + '" title="' + esc(x.file + (x.line ? ':' + x.line : '')) + '">' +
+      ? '<a href="' + href + '" title="' + esc(x.file + (x.line ? ':' + x.line +
+          (x.end && x.end > x.line ? '\u2013' + x.end : '') : '')) + '">' +
         (x.kind === 'test' ? 'test &#8599;' : '#' + (x.issue || '') + ' &#8599;') + '</a>'
       : '<span class="none">&mdash;</span>';
     const ran = x.kind === 'test' && (x.status === 'pass' || x.status === 'FAIL');
