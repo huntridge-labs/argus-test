@@ -213,8 +213,8 @@ renderNav({ el: 'nav', root: '' });
   // Same sentences the board uses for the worst failing class, so the three
   // levels of the site describe a run the same way.
   var LINE = {
-    open:      'reports success without scanning',
-    closed:    'argus refuses to run where it should work',
+    open:      'argus reports success without running the check it was asked for',
+    closed:    'argus errors out where it should succeed -- the pipeline stops, nothing gets through',
     auxiliary: 'an auxiliary path is broken; scans and gates still work',
     none:      'every defined test that ran, passed'
   };

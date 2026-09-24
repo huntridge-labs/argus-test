@@ -316,6 +316,11 @@ jobs:
     name: "N3: unscannable image exits 2"
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # N3 can fail two ways that mean different things (failure-classes.json):
+    # exit 0 is fail-open -- nothing scanned, caller sees a pass; exit 1 still
+    # stops the pipeline, so it is fail-closed. The step says which.
+    outputs:
+      class: ${{ steps.n3.outputs.class }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -336,6 +341,7 @@ jobs:
           echo "$HOME/scanbin" >> "$GITHUB_PATH"
 
       - name: An image that cannot be pulled must exit 2, never 0
+        id: n3
         run: |
           set -uo pipefail
           set +e
@@ -347,9 +353,12 @@ jobs:
           tail -30 n3.log
           case "$RC" in
             2) echo "PASS N3: unscannable image exited 2 as the contract requires" ;;
-            0) echo "::error title=N3::An unpullable image exited 0. Nothing was scanned and the caller sees a pass -- 'nothing could be scanned' is never 0."; exit 1 ;;
-            1) echo "::error title=N3::An unpullable image exited 1, which means 'findings at or above the threshold'. A caller distinguishing a failing gate from a broken scan would read this as real findings. Expected 2."; exit 1 ;;
-            *) echo "::error title=N3::Expected exit 2, got $RC."; exit 1 ;;
+            0) echo "class=open" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::An unpullable image exited 0. Nothing was scanned and the caller sees a pass -- 'nothing could be scanned' is never 0."; exit 1 ;;
+            1) echo "class=closed" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::An unpullable image exited 1, which means 'findings at or above the threshold'. A caller distinguishing a failing gate from a broken scan would read this as real findings. Expected 2."; exit 1 ;;
+            *) echo "class=closed" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::Expected exit 2, got $RC."; exit 1 ;;
           esac
 
   # --------------------------------------------------------------------------
@@ -526,9 +535,15 @@ jobs:
     name: "N5: local image with a platform pin"
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Three ways to fail, three classes: a non-zero exit stops the pipeline
+    # (fail-closed); exit 0 with no mention of a platform is a scan of the wrong
+    # architecture reported as a pass (fail-open); a warning that never names
+    # the variant scanned tells the reader something was substituted but not
+    # what, while the scan itself is fine (auxiliary).
     outputs:
       verdict: ${{ steps.assert5.outputs.verdict }}
       reason: ${{ steps.assert5.outputs.reason }}
+      class: ${{ steps.assert5.outputs.class }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -596,6 +611,7 @@ jobs:
           tail -40 n5.log
 
           if [ "$RC" -ne 0 ]; then
+            echo "class=closed" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::Scanning a locally-built, never-pushed image with --platform linux/$OTHER exited $RC. The requested variant is not in the cache and no registry can be consulted, so argus must fall back to the cached variant and say so -- not attempt a registry pull that cannot succeed. This is the air-gapped and docker-load shape."
             exit 1
           fi
@@ -603,10 +619,12 @@ jobs:
           # The cached variant is linux/$HOST_ARCH, not the linux/$OTHER that
           # was asked for. The report has to name what it actually looked at.
           if ! grep -qiE "(platform|architecture|arch)" n5.log; then
+            echo "class=open" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::The scan exited 0 but never mentions a platform or architecture. It scanned the cached linux/$HOST_ARCH variant while the caller asked for linux/$OTHER; a substitution nobody is told about is a scan of the wrong thing reported as the right thing."
             exit 1
           fi
           if ! grep -qiE "$HOST_ARCH" n5.log; then
+            echo "class=auxiliary" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::The output mentions a platform but never names linux/$HOST_ARCH, the variant actually scanned. The warning has to say which architecture the findings describe, not merely that a substitution happened."
             exit 1
           fi
@@ -636,12 +654,14 @@ jobs:
           N2_RAW: ${{ needs.n1-n2-daemonless.outputs.n2 }}
           PAIR_WHY: ${{ needs.n1-n2-daemonless.outputs.reason }}
           N3: ${{ needs.n3-unscannable-exit-code.result }}
+          N3_CLASS: ${{ needs.n3-unscannable-exit-code.outputs.class }}
           N4: ${{ needs.n4-retry-platform.result }}
           N4_RAW: ${{ needs.n4-retry-platform.outputs.verdict }}
           N4_WHY: ${{ needs.n4-retry-platform.outputs.reason }}
           N5: ${{ needs.n5-local-image-platform-pin.result }}
           N5_RAW: ${{ needs.n5-local-image-platform-pin.outputs.verdict }}
           N5_WHY: ${{ needs.n5-local-image-platform-pin.outputs.reason }}
+          N5_CLASS: ${{ needs.n5-local-image-platform-pin.outputs.class }}
         run: |
           to_status() {
             case "$1" in
@@ -673,11 +693,13 @@ jobs:
             --arg n4why "$N4_WHY" \
             --arg n5 "$(half "$N5_RAW" "$N5")" \
             --arg n5why "$N5_WHY" \
+            --arg n3class "$N3_CLASS" \
+            --arg n5class "$N5_CLASS" \
             '[
               {"id":"N1","name":"daemonless default scan","detail":"Does a default container scan still exit 0 when only some of the default sub-scanners can run here, naming the ones that could not?","status":$n1,"reason":$pairwhy},
               {"id":"N2","name":"daemonless explicit request","detail":"Does an explicitly requested sub-scanner that cannot run on this host exit non-zero rather than reporting success?","status":$n2,"reason":$pairwhy},
-              {"id":"N3","name":"unscannable image exit code","detail":"Does argus exit 2, distinct from 1, when an image cannot be pulled and nothing could be scanned?","status":$n3},
+              {"id":"N3","name":"unscannable image exit code","detail":"Does argus exit 2, distinct from 1, when an image cannot be pulled and nothing could be scanned?","status":$n3,"class":$n3class},
               {"id":"N4","name":"retry platform is published","detail":"Does a failed pull retry against a platform the manifest publishes rather than hardcoding linux/amd64?","status":$n4,"reason":$n4why},
-              {"id":"N5","name":"local image platform pin","detail":"Does a locally-built never-pushed image scan under an explicit platform pin, naming which architecture the findings describe?","status":$n5,"reason":$n5why}
+              {"id":"N5","name":"local image platform pin","detail":"Does a locally-built never-pushed image scan under an explicit platform pin, naming which architecture the findings describe?","status":$n5,"reason":$n5why,"class":$n5class}
             ]')
           echo "results=$RESULTS" >> "$GITHUB_OUTPUT"

@@ -3,6 +3,16 @@
     "What a FAILURE of each test costs a consumer. A passing test contributes",
     "nothing; only failures score.",
     "",
+    "HOW A TEST GETS ITS CLASS. From what its failure means, per the glossary",
+    "below: a test that expects argus to block (a gate fires, a bad input is",
+    "rejected, a non-zero exit) fails OPEN when argus lets it through; a test",
+    "that expects argus to succeed fails CLOSED when argus errors out; a test of",
+    "something around the scan fails AUXILIARY. A test that can fail more than",
+    "one way reports which in its result ('class'), and that wins over the list",
+    "here -- N3 (exit 0 is open, exit 1 is closed) and N5 (a non-zero exit is",
+    "closed, a silent wrong-architecture pass is open) do. A test listed nowhere",
+    "is 'closed' by default.",
+    "",
     "WHAT IS CITED AND WHAT IS NOT. Be clear about this, because the two get",
     "read as one thing:",
     "",
@@ -66,12 +76,12 @@
     "open": {
       "word": "FAIL",
       "tone": "bad",
-      "line": "at least one test reports success without scanning -- see the failing rows"
+      "line": "argus reports success without running the check it was asked for"
     },
     "closed": {
       "word": "FAIL",
       "tone": "bad",
-      "line": "argus refuses to run where it should work"
+      "line": "argus errors out where it should succeed -- the pipeline stops, nothing gets through"
     },
     "none": {
       "word": "PASS",
@@ -96,6 +106,7 @@
   },
   "classes": {
     "open": [
+      "A5",
       "C3",
       "C4",
       "C5",
@@ -104,6 +115,7 @@
       "D4",
       "D5",
       "E5",
+      "E6",
       "E8",
       "E9",
       "N2",
@@ -122,8 +134,7 @@
       "U4"
     ],
     "closed": [
-      "N1",
-      "N5"
+      "N1"
     ]
   },
   "references": [
@@ -155,6 +166,12 @@
     "",
     "E5 and E9 are the same class observed directly: a scan naming no",
     "recognised scanner, and a remote scan with an empty image_ref, both report",
-    "success having scanned nothing."
+    "success having scanned nothing.",
+    "",
+    "E6 and A5 assert that argus REJECTS an input -- a typo'd scanner name, two",
+    "containers with the same name. If one goes red, argus accepted it and",
+    "scanned less than it was asked to (the typo'd scanner, the container the",
+    "duplicate replaced) while reporting success. They were left at the 'closed'",
+    "default until an audit against the glossary."
   ]
 }

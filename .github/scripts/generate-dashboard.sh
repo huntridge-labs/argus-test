@@ -94,7 +94,7 @@ RISK=$(jq -n -c --argjson all "$ALL_JSON" --argjson fc "${CLASSES_JSON:-null}" '
   | (($f.weights) // {open:10, closed:3, auxiliary:1}) as $w
   | (($f.default) // "closed") as $dflt
   | (($f.classes) // {} | to_entries | map(.value[] as $id | {key:$id, value:.key}) | from_entries) as $cls
-  | [ $all[] | select(.status == "FAIL") | ($cls[.id] // $dflt) | ($w[.] // 0) ] | add // 0')
+  | [ $all[] | select(.status == "FAIL") | (((.class // "") as $c | if ($w | has($c)) then $c else ($cls[.id] // $dflt) end)) | ($w[.] // 0) ] | add // 0')
 echo "Risk index: $RISK"
 
 
@@ -287,7 +287,7 @@ WORST=$(jq -n -r --argjson all "$ALL_JSON" --argjson fc "${CLASSES_JSON:-null}" 
   | (($f.weights) // {open:10, closed:3, auxiliary:1}) as $w
   | (($f.default) // "closed") as $dflt
   | (($f.classes) // {} | to_entries | map(.value[] as $id | {key:$id, value:.key}) | from_entries) as $cls
-  | [$all[] | select(.status == "FAIL") | ($cls[.id] // $dflt)] as $fc2
+  | [$all[] | select(.status == "FAIL") | (((.class // "") as $c | if ($w | has($c)) then $c else ($cls[.id] // $dflt) end))] as $fc2
   | ($w | to_entries | sort_by(-.value) | map(.key))
   | map(select(. as $c | $fc2 | index($c))) | first // "none"')
 echo "Defined: $DEFINED   passing: $PASSED ($PCT_DEFINED%)   worst class: $WORST"
@@ -456,11 +456,14 @@ a:hover { border-bottom-color: var(--primary); }
 .hero { margin-bottom: 14px; }
 /* Plots first, then what they are about: the charts carry the measurement, the
    strip beneath names the failures behind it. */
-.hero-detail {
-  padding: 16px 24px 18px; display: flex; align-items: baseline;
-  justify-content: space-between; gap: 18px 24px; flex-wrap: wrap;
+.plot-foot {
+  padding: 14px 24px 16px; display: flex; align-items: baseline; min-width: 0;
+  justify-content: space-between; gap: 10px 16px; flex-wrap: wrap;
   border-top: 1px solid var(--border);
 }
+.plot-foot .rate { flex: 1 1 220px; }
+#rate-break { font-size: 0.82rem; color: var(--fg3); }
+#rate-break b { color: var(--fg2); font-weight: 600; }
 /* Heads on row 1, charts on row 2, both spanning the same grid. Each row is
    sized once for the whole row, so the two x axes share a baseline even if one
    head wraps to a second line. */
@@ -477,8 +480,10 @@ a:hover { border-bottom-color: var(--primary); }
      "Risk index" and "Pass rate" together above two unlabelled charts. */
   .hero-plots > :nth-child(1) { order: 1; }
   .hero-plots > :nth-child(3) { order: 2; }
-  .hero-plots > :nth-child(2) { order: 3; }
-  .hero-plots > :nth-child(4) { order: 4; }
+  .hero-plots > :nth-child(5) { order: 3; }
+  .hero-plots > :nth-child(2) { order: 4; }
+  .hero-plots > :nth-child(4) { order: 5; }
+  .hero-plots > :nth-child(6) { order: 6; }
 }
 .badge {
   font-size: 2.1rem; font-weight: 700; line-height: 1; padding: 12px 20px;
@@ -640,7 +645,7 @@ details.working[open] > summary { margin-bottom: 8px; }
 .stat-name .info { color: var(--fg3); text-decoration: none; border: none; font-size: 0.95em;
   margin-left: 3px; text-transform: none; }
 .stat-name .info:hover { color: var(--fg); }
-.statline .sum { color: var(--fg3); white-space: nowrap; }
+.statline .sum { display: block; margin-top: 3px; color: var(--fg3); font-weight: 400; }
 .statline .sum b { color: var(--fg2); font-weight: 600; }
 .method-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(260px, 1fr); gap: 28px; align-items: start; }
 @media (max-width: 760px) { .method-grid { grid-template-columns: 1fr; gap: 16px; } }
@@ -800,10 +805,11 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
       </div>
       <div class="plot-body"><svg id="risk-trend" class="trend-svg"></svg></div>
       <div class="plot-body col2"><svg id="rate-trend" class="trend-svg"></svg></div>
-    </div>
-    <div class="hero-detail">
-      <span class="rate" id="rate"></span>
-      <div class="stats" id="stats"></div>
+      <!-- What each number is made of, under its own chart: the verdict and the
+           risk arithmetic belong to the risk index, and "not run" moves the
+           pass rate, not the risk. -->
+      <div class="plot-foot"><span class="rate" id="rate"></span><div class="stats" id="stats"></div></div>
+      <div class="plot-foot col2"><span class="rate" id="rate-break"></span><div class="stats" id="stats2"></div></div>
     </div>
   </section>
 
@@ -926,8 +932,10 @@ __NAV_JS__
   const ran = {};
   d.categories.forEach(function (cat) {
     cat.tests.forEach(function (t) {
+      // reason and class ride along: the row below reads r.reason, which was
+      // never copied here, so a skip's explanation never reached the board.
       ran[t.id] = { status: t.status, category: cat.name, detail: t.detail,
-                    checks: t.checks, stats: t.stats };
+                    checks: t.checks, stats: t.stats, reason: t.reason, cls: t.class };
     });
   });
   const docs = [];
@@ -940,6 +948,7 @@ __NAV_JS__
       question: (r && r.detail) || c.question || '',
       status: r ? r.status : 'notrun',
       reason: r ? (r.reason || '') : '',
+      failclass: r ? (r.cls || '') : '',
       category: c.category || (r && r.category),
       file: c.file || '', line: c.line || null, why: '', scope: c.scope || 'all',
       checks: (r && r.checks) || c.checks || null,
@@ -950,7 +959,7 @@ __NAV_JS__
     cat.tests.forEach(function (t) {
       if (seen[t.id]) return;
       docs.push({
-        kind: 'test', id: t.id, name: t.name, question: t.detail || '',
+        kind: 'test', id: t.id, name: t.name, question: t.detail || '', failclass: t.class || '',
         status: t.status, category: cat.name, file: '', line: null, why: '',
         checks: t.checks || null, stats: t.stats || null
       });
@@ -1033,7 +1042,11 @@ __NAV_JS__
     });
   }
   const DEFAULT_CLASS = (FC && FC.default) || 'closed';
-  function failClass(x) { return CLASS_OF[x.id] || DEFAULT_CLASS; }
+  // A test that can fail more than one way reports which (N3, N5); that wins
+  // over the fixed class in failure-classes.json, which cannot know.
+  function failClass(x) {
+    return (x.failclass && W[x.failclass] != null) ? x.failclass : (CLASS_OF[x.id] || DEFAULT_CLASS);
+  }
 
   const failing = tests.filter(function (x) { return x.status === 'FAIL'; });
   const byClass = {};
@@ -1060,8 +1073,8 @@ __NAV_JS__
   const REFS = (FC && FC.references) || [];
   const IDX = (FC && FC.index) || { name: 'Risk', anchor: '0 = clean' };
   const STATUS = (FC && FC.status) || {
-    open: { word: 'FAIL', tone: 'bad', line: 'tests report success without scanning' },
-    closed: { word: 'FAIL', tone: 'bad', line: 'argus refuses to run where it should work' },
+    open: { word: 'FAIL', tone: 'bad', line: 'argus reports success without running the check it was asked for' },
+    closed: { word: 'FAIL', tone: 'bad', line: 'argus errors out where it should succeed -- the pipeline stops, nothing gets through' },
     auxiliary: { word: 'FAIL', tone: 'warn', line: 'an auxiliary path is broken; scans and gates still work' },
     none: { word: 'PASS', tone: 'good', line: 'every defined test that ran, passed' }
   };
@@ -1076,11 +1089,11 @@ __NAV_JS__
   // No verdict badge: a non-zero risk already says the run failed, and the
   // sentence below says what failed. A FAIL chip next to a red 24 is the same
   // fact twice.
-  if (worst === 'open') {
-    const ids = (byClass.open || []).map(function (x) { return x.id; });
-    st.line = ids.length + ' test' + (ids.length === 1 ? '' : 's') +
-              ' report success without scanning. See ' + testLinks(ids) + '.';
-  }
+  // The sentence says what the worst class means, in the glossary's terms;
+  // which tests, and what each cost, follows it as the risk arithmetic. (It
+  // used to append "N tests report success without scanning. See …" -- which
+  // named the tests twice and was not true of N5, which did scan: the wrong
+  // architecture.)
 
   // Risk carries the severity colour because that is what it measures. Pass
   // rate stays neutral: it is a breadth figure, and 95% is neither good nor bad
@@ -1097,6 +1110,8 @@ __NAV_JS__
   $('rate-num').textContent = pctPass + '%';
   $('rate-num').className = 'stat-num';
   $('rate-sub').textContent = nPass + '/' + tests.length;
+  $('rate-break').innerHTML = '<b>' + nPass + '</b> passed \u00b7 <b>' + nFail + '</b> failed \u00b7 <b>' +
+    nIdle + '</b> not run \u2014 all ' + tests.length + ' defined tests count';
 
   // The index's working, beside the sentence it qualifies: which tests produced
   // the number and what each cost. Named per test while that stays short; past
@@ -1113,7 +1128,7 @@ __NAV_JS__
       : ORDER.filter(function (c) { return (byClass[c] || []).length; }).map(function (c) {
           return (byClass[c] || []).length + ' ' + esc(SHORT[c] || LBL[c] || c) + ' \u00d7 ' + (W[c] || 0);
         });
-    riskSum = ' <span class="sum">\u00b7 risk <b>' + risk + '</b> = ' + riskTerms.join(' + ') + '</span>';
+    riskSum = '<span class="sum">risk <b>' + risk + '</b> = ' + riskTerms.join(' + ') + '</span>';
   }
   $('rate').innerHTML = '<div class="statline">' + st.line + riskSum + '</div>';
 
@@ -1184,7 +1199,7 @@ __NAV_JS__
                gloss: (LBL[c] ? LBL[c] + ' \u2014 ' : '') + (GLOSS[c] || ''),
                n: (byClass[c] || []).length };
     }));
-  const statsEl = $('stats');
+  const statsEl = $('stats'), stats2El = $('stats2');
   STAT_DEFS.forEach(function (s) {
     if (s.n === 0 && s.key !== 'all') return;
     const b = document.createElement('button');
@@ -1198,10 +1213,10 @@ __NAV_JS__
     b.title = (s.gloss ? s.gloss + ' ' : '') + '(click to show only these tests)';
     b.innerHTML = '<b>' + s.n + '</b> ' + s.label;
     b.addEventListener('click', function () { toggleFilter(s.key); });
-    statsEl.appendChild(b);
+    (s.key === 'not-run' ? stats2El : statsEl).appendChild(b);
   });
   function syncStats(active) {
-    Array.prototype.forEach.call(statsEl.children, function (b) {
+    Array.prototype.forEach.call([].slice.call(statsEl.children).concat([].slice.call(stats2El.children)), function (b) {
       const k = b.dataset.filter;
       const on = active.indexOf(k) > -1;
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
