@@ -20,6 +20,16 @@ set -euo pipefail
 OUT="${PAGES_DIR:?PAGES_DIR not set}"
 mkdir -p "$OUT"
 
+# The dashboard lives at <branch>/tests/, but history.json and favicon.png are
+# shared with the root index and the branch redirect, so they sit one level
+# up at the branch root. SHARED_DIR defaults to OUT so the script still works
+# standalone.
+SHARED_DIR="${SHARED_DIR:-$OUT}"
+mkdir -p "$SHARED_DIR"
+# How the page reaches the shared files and its siblings: '' when the dashboard
+# IS the branch root, '../' when nested under tests/.
+UP="${SITE_UP:-}"
+
 # ---------- safe JSON helper (empty string → []) ----------
 safe_json() {
   if [ -n "$1" ] && echo "$1" | jq empty 2>/dev/null; then
@@ -38,6 +48,8 @@ EDGE_JSON=$(safe_json "${EDGE_JSON:-}")
 WF_JSON=$(safe_json "${WF_JSON:-}")
 SCN_JSON=$(safe_json "${SCN_JSON:-}")
 REGRESSION_JSON=$(safe_json "${REGRESSION_JSON:-}")
+RUNTIME_JSON=$(safe_json "${RUNTIME_JSON:-}")
+RUNTIME_JSON=$(safe_json "${RUNTIME_JSON:-}")
 ALL_JSON=$(safe_json "${ALL_JSON:-}")
 
 # ---------- compute stats ----------
@@ -47,7 +59,7 @@ FAILED=$(echo "$ALL_JSON" | jq '[.[] | select(.status == "FAIL")] | length')
 SKIPPED=$(echo "$ALL_JSON" | jq '[.[] | select(.status == "skip" or .status == "cancel")] | length')
 RUNNABLE=$((TOTAL - SKIPPED))
 [ "$RUNNABLE" -eq 0 ] && RUNNABLE=1
-PASS_RATE=$((PASSED * 100 / RUNNABLE))
+PASS_RATE=$((PASSED * 100 / RUNNABLE))   # superseded below by PCT_DEFINED; see there
 
 if [ "$FAILED" -eq 0 ] && [ "$PASSED" -gt 0 ]; then
   VERDICT="PASS"
@@ -58,12 +70,13 @@ fi
 DATE_STR=$(date -u '+%Y-%m-%d %H:%M UTC')
 
 # ---------- history ----------
-HISTORY_FILE="$OUT/history.json"
+HISTORY_FILE="$SHARED_DIR/history.json"
 if [ ! -f "$HISTORY_FILE" ]; then
   echo '[]' > "$HISTORY_FILE"
 fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/site-nav.sh"
 # ---------- failure classes (what a red test costs a consumer) ------------
 CLASSES_FILE="$SCRIPT_DIR/../data/failure-classes.json"
 if [ -f "$CLASSES_FILE" ] && jq empty "$CLASSES_FILE" 2>/dev/null; then
@@ -78,27 +91,12 @@ fi
 # failing tests, with the file's default applied to anything unclassified.
 RISK=$(jq -n -c --argjson all "$ALL_JSON" --argjson fc "${CLASSES_JSON:-null}" '
   ($fc // {}) as $f
-  | (($f.weights) // {open:10, closed:3, degraded:1}) as $w
+  | (($f.weights) // {open:10, closed:3, auxiliary:1}) as $w
   | (($f.default) // "closed") as $dflt
   | (($f.classes) // {} | to_entries | map(.value[] as $id | {key:$id, value:.key}) | from_entries) as $cls
-  | [ $all[] | select(.status == "FAIL") | ($cls[.id] // $dflt) | ($w[.] // 0) ] | add // 0')
+  | [ $all[] | select(.status == "FAIL") | (((.class // "") as $c | if ($w | has($c)) then $c else ($cls[.id] // $dflt) end)) | ($w[.] // 0) ] | add // 0')
 echo "Risk index: $RISK"
 
-CURRENT_RUN=$(jq -n -c \
-  --argjson risk "$RISK" \
-  --arg date "$DATE_STR" \
-  --arg scope "$SCOPE" \
-  --argjson passed "$PASSED" \
-  --argjson total "$TOTAL" \
-  --argjson rate "$PASS_RATE" \
-  --arg verdict "$VERDICT" \
-  --arg url "$RUN_URL" \
-  --arg run_id "$RUN_ID" \
-  '{date:$date, scope:$scope, passed:$passed, total:$total, rate:$rate, risk:$risk, verdict:$verdict, url:$url, run_id:$run_id}')
-
-# Append and cap at 20
-jq -c --argjson run "$CURRENT_RUN" '. + [$run] | .[-20:]' "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
-mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
 
 # ---------- build category data for HTML ----------
 cat_status() {
@@ -136,6 +134,10 @@ CATEGORIES=$(jq -n -c \
   --arg i1s "$(cat_status "$I1_RESULT")" \
   --arg i2s "$(cat_status "$I2_RESULT")" \
   --arg i3s "$(cat_status "$I3_RESULT")" \
+  --arg i4s "$(cat_status "${I4_RESULT:-skipped}")" \
+  --arg i5s "$(cat_status "${I5_RESULT:-skipped}")" \
+  --arg i6s "$(cat_status "${I6_RESULT:-skipped}")" \
+  --arg i4s "$(cat_status "${I4_RESULT:-skipped}")" \
   --argjson u "$UNIT_JSON" \
   --argjson a "$ACTIONS_JSON" \
   --argjson r "$REMOTE_JSON" \
@@ -145,19 +147,30 @@ CATEGORIES=$(jq -n -c \
   --argjson wf "$WF_JSON" \
   --argjson sc "$SCN_JSON" \
   --argjson ig "$REGRESSION_JSON" \
+  --argjson rt "$RUNTIME_JSON" \
+  --arg rts "$(cat_status "${RUNTIME_RESULT:-skipped}")" \
   '[
     {name:"Unit Tests",        status:$us, tests:$u},
     {name:"Direct Action Tests",status:$as, tests:$a},
+    {name:"Runtime Environment Tests", status:$rts, tests:$rt},
     {name:"Remote Mode Tests", status:$rs, tests:$r},
     {name:"Discover Mode Tests",status:$ds, tests:$d},
     {name:"Combination Tests", status:$cs, tests:$co},
     {name:"Edge & Adversarial", status:$es, tests:$ed},
     {name:"Top-level Workflow Tests", status:$ws, tests:$wf},
     {name:"SCN Detector Tests",status:$ss, tests:$sc},
-    {name:"Infrastructure Scan (I1)",   status:$i1s,tests:[$ig[0]]},
+    {name:"Happy Path (I1)",            status:$i1s,tests:[$ig[0]]},
     {name:"No Hardcoded URLs (I2)",     status:$i2s,tests:[$ig[1]]},
-    {name:"Config-Driven Scan (I3)",    status:$i3s,tests:[$ig[2]]}
-  ]')
+    {name:"Config-Driven Scan (I3)",    status:$i3s,tests:[$ig[2]]},
+    {name:"Dispatch Targets (I4)",      status:$i4s,tests:[$ig[3]]},
+    {name:"Infrastructure Scan (I5)",   status:$i5s,tests:[$ig[4]]},
+    {name:"No Duplicate Tests (I6)",    status:$i6s,tests:[$ig[5]]}
+  ]
+  # Indexing a short REGRESSION_JSON yields nulls, which reach the browser as
+  # `null` entries and throw on the first property access -- the whole board
+  # goes blank. Drop them here: a regression row that did not report should
+  # make its category empty, not take the page down.
+  | map(.tests |= map(select(. != null)))')
 
 # ---------- test catalog (every test the suite DEFINES, not just what ran) ----
 # The run results only contain categories that executed, so on a push (where
@@ -171,6 +184,7 @@ category_for() {
   case "$1" in
     test-unit)            echo "Unit Tests" ;;
     test-actions-direct)  echo "Direct Action Tests" ;;
+    test-runtime-env)     echo "Runtime Environment Tests" ;;
     test-remote)          echo "Remote Mode Tests" ;;
     test-discover)        echo "Discover Mode Tests" ;;
     test-combination)     echo "Combination Tests" ;;
@@ -192,17 +206,44 @@ scope_for() {
 }
 
 CATALOG_JSON='[]'
-for wf in test-unit test-actions-direct test-remote test-discover test-combination test-edge test-workflows test-scn-detector test-suite; do
+for wf in test-unit test-actions-direct test-runtime-env test-remote test-discover test-combination test-edge test-workflows test-scn-detector test-suite; do
   f="$WF_DIR/$wf.yml"
   [ -f "$f" ] || continue
-  # Pull the jq array literal the collect step builds, and blank out the shell
-  # variable references so it becomes parseable JSON.
+
+  # Two collect-step shapes exist, and only one was ever parsed here.
+  #
+  # (a) an inline jq array literal  -- test-unit, test-actions-direct,
+  #     test-runtime-env, test-suite
+  # (b) a /tmp/detail.json heredoc  -- test-remote, test-discover,
+  #     test-combination, test-edge, test-workflows
+  #
+  # Shape (b) yielded an empty `part`, which was then passed to
+  # `jq --argjson p ""` -- invalid JSON, non-zero exit, and under `set -e` the
+  # whole script died. That is why "Generate dashboard" has been failing on
+  # every dev run and the published site has no index.html. Five of the nine
+  # categories, and the 42 tests in them, were also missing from the search
+  # corpus, so the page would have answered "not tested" about things that are.
   part=$(sed -n "/^ *'\[$/,/^ *\]')$/p" "$f" \
     | sed -e "s/^ *'\[$/[/" -e "s/^ *\]')$/]/" \
     | sed -E 's/:\$[a-z0-9_]+/:null/g' \
     | jq -c --arg cat "$(category_for "$wf")" --arg file ".github/workflows/$wf.yml" \
            --arg scope "$(scope_for "$wf")" \
         '[.[] | {id, name, question: .detail, category: $cat, file: $file, scope: $scope}]' 2>/dev/null) || part=""
+
+  # Shape (b): the heredoc maps id -> [name, question]. Dedent it and read it
+  # as the object it already is.
+  if [ -z "$part" ] || [ "$part" = "[]" ]; then
+    part=$(awk "/cat > \/tmp\/detail.json <<'JSON'/{f=1;next} f&&/^ *JSON$/{exit} f" "$f" \
+      | sed -E 's/^ {10}//' \
+      | jq -c --arg cat "$(category_for "$wf")" --arg file ".github/workflows/$wf.yml" \
+             --arg scope "$(scope_for "$wf")" \
+          'to_entries | [.[] | {id: .key, name: .value[0], question: .value[1],
+                                category: $cat, file: $file, scope: $scope}]' 2>/dev/null) || part=""
+  fi
+
+  # Never hand an empty string to --argjson. A category that cannot be parsed
+  # must degrade to "no catalog entries", not take the whole board down.
+  [ -n "$part" ] || part='[]'
 
   # Line number of each test's job definition, so a row links to the source that
   # defines it instead of repeating the same run URL on every row. Job names look
@@ -223,14 +264,87 @@ done
 echo "Test catalog entries: $(echo "$CATALOG_JSON" | jq 'length')"
 
 
+# ---------- history ----------
+# Written here, not earlier: DEFINED is the catalog count, so this has to
+# run after the catalog exists.
+# DEFINED is the catalog count -- every test the suite declares, including the
+# ones that did not run. It is the denominator the board divides by, and it is
+# NOT the same as TOTAL (results actually reported). Persisting both, plus the
+# worst failing class, is what stops the root index, the branch hub and the
+# dashboard from each deriving a slightly different headline from the same run
+# and disagreeing in public.
+DEFINED=$(echo "$CATALOG_JSON" | jq 'length')
+[ "$DEFINED" -gt 0 ] 2>/dev/null || DEFINED="$TOTAL"
+# THE pass rate: passed / defined, rounded down, everywhere. There were three
+# -- passed/defined on the headline, passed/(total - skipped) on the trend
+# line, passed/(passed + failed) for "vs last run" -- and they disagreed
+# whenever a test did not run. A test that did not run was not verified, so it
+# counts against; rounding down means the figure never overstates.
+PCT_DEFINED=$(( DEFINED > 0 ? PASSED * 100 / DEFINED : 0 ))
+PASS_RATE=$PCT_DEFINED
+WORST=$(jq -n -r --argjson all "$ALL_JSON" --argjson fc "${CLASSES_JSON:-null}" '
+  ($fc // {}) as $f
+  | (($f.weights) // {open:10, closed:3, auxiliary:1}) as $w
+  | (($f.default) // "closed") as $dflt
+  | (($f.classes) // {} | to_entries | map(.value[] as $id | {key:$id, value:.key}) | from_entries) as $cls
+  | [$all[] | select(.status == "FAIL") | (((.class // "") as $c | if ($w | has($c)) then $c else ($cls[.id] // $dflt) end))] as $fc2
+  | ($w | to_entries | sort_by(-.value) | map(.key))
+  | map(select(. as $c | $fc2 | index($c))) | first // "none"')
+echo "Defined: $DEFINED   passing: $PASSED ($PCT_DEFINED%)   worst class: $WORST"
+
+CURRENT_RUN=$(jq -n -c \
+  --argjson risk "$RISK" \
+  --argjson defined "$DEFINED" \
+  --argjson pct_defined "$PCT_DEFINED" \
+  --arg worst "$WORST" \
+  --arg date "$DATE_STR" \
+  --arg scope "$SCOPE" \
+  --arg branch "${BRANCH_NAME:-}" \
+  --arg self_sha "${SELF_SHA:-}" \
+  --arg self_repo "${REPO:-}" \
+  --argjson passed "$PASSED" \
+  --argjson total "$TOTAL" \
+  --argjson rate "$PASS_RATE" \
+  --arg verdict "$VERDICT" \
+  --arg url "$RUN_URL" \
+  --arg run_id "$RUN_ID" \
+  '{date:$date, scope:$scope, branch:$branch, self_sha:$self_sha, self_repo:$self_repo,
+    passed:$passed, total:$total, defined:$defined,
+    rate:$rate, pct_defined:$pct_defined, risk:$risk, worst:$worst,
+    verdict:$verdict, url:$url, run_id:$run_id}')
+
+# Append and cap at 20
+jq -c --argjson run "$CURRENT_RUN" '. + [$run] | .[-20:]' "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
+mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+
+
 # ---------- coverage gaps (searchable "is this tested?" corpus) ----------
 GAPS_FILE="$SCRIPT_DIR/../data/coverage-gaps.json"
 if [ -f "$GAPS_FILE" ] && jq empty "$GAPS_FILE" 2>/dev/null; then
-  GAPS_JSON=$(jq -c '.' "$GAPS_FILE")
-  echo "Coverage gaps loaded: $(echo "$GAPS_JSON" | jq 'length')"
+  # The file was a bare array; it now carries _comment and _retired alongside
+  # a .gaps array. Accept both so an older checkout of the data file still
+  # renders rather than silently showing no gaps -- "nothing listed" and "no
+  # gaps" look identical on the page, which is the confusion this list exists
+  # to prevent.
+  GAPS_JSON=$(jq -c 'if type == "array" then . else (.gaps // []) end' "$GAPS_FILE")
+  RETIRED_JSON=$(jq -c 'if type == "array" then [] else (._retired // []) end' "$GAPS_FILE")
+  echo "Coverage gaps loaded: $(echo "$GAPS_JSON" | jq 'length') (retired: $(echo "$RETIRED_JSON" | jq 'length'))"
 else
   GAPS_JSON='[]'
+  RETIRED_JSON='[]'
   echo "WARNING: no readable $GAPS_FILE — search will not be able to answer 'not covered'"
+fi
+
+# ---------- ref liveness (which half of a branch run is actually the branch) --
+# Written by audit-ref-liveness.sh earlier in the job. Absent is not the same
+# as "everything is live", so a missing file renders as unknown.
+LIVENESS_FILE="${LIVENESS_FILE:-$OUT/ref-liveness.json}"
+if [ -f "$LIVENESS_FILE" ] && jq empty "$LIVENESS_FILE" 2>/dev/null; then
+  LIVENESS_JSON=$(jq -c '.' "$LIVENESS_FILE")
+  echo "Ref liveness loaded: sdk_live=$(jq -r '.summary.sdk_live' "$LIVENESS_FILE")"
+else
+  LIVENESS_JSON='null'
+  echo "No ref-liveness.json -- this page will not claim anything about which parts of the ref are live"
 fi
 
 HISTORY_DATA=$(cat "$HISTORY_FILE")
@@ -243,14 +357,15 @@ cat > "$OUT/index.html" << 'HTMLEOF'
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Argus Test Suite</title>
-<link rel="icon" type="image/png" href="favicon.png">
-<link rel="apple-touch-icon" href="favicon.png">
+<link rel="icon" type="image/png" href="__UP__favicon.png">
+<link rel="apple-touch-icon" href="__UP__favicon.png">
 <style>
 /* Bootswatch Lux-flavoured: Nunito Sans, near-black primary, hairline borders,
    square corners, uppercase letter-spaced labels, generous whitespace.
    Hand-written rather than pulling Bootstrap + Lux (≈250KB) so the page stays a
    single self-contained file; only the typeface is fetched. */
 @import url('https://fonts.googleapis.com/css2?family=Nunito+Sans:ital,wght@0,300;0,400;0,600;0,700&display=swap');
+__NAV_CSS__
 :root {
   --bg: #ffffff; --surface: #ffffff; --surface2: #f8f9fa;
   --fg: #1a1a1a; --fg2: #55595c; --fg3: #919aa1;
@@ -312,11 +427,21 @@ a:hover { border-bottom-color: var(--primary); }
 /* Lux signature: small, uppercase, widely tracked labels */
 .lbl { text-transform: uppercase; letter-spacing: var(--track); font-weight: 600; font-size: 0.7rem; color: var(--fg3); }
 
-header { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; margin-bottom: 30px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
-header h1 {
-  margin: 0; font-size: 1.05rem; font-weight: 700; color: var(--fg);
-  text-transform: uppercase; letter-spacing: 0.12em;
+/* Argus's eye beside the title. Grayscaled deliberately: it is a mark, not a
+   status light, and the page already spends colour on severity -- a green eye
+   next to a red risk number competes with the one signal that should carry it.
+   The source is the same 32x32 PNG used as the favicon, so nothing extra is
+   fetched. Slightly darkened in light mode: the green grayscales to about
+   #a1a1a1, which sits well on near-black but is weak on white.
+   aria-hidden because the title beside it already says the name. */
+.eye { height: 1.2em; width: auto; vertical-align: -0.2em; margin-right: 0.55em;
+       filter: grayscale(1) brightness(0.72); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .eye { filter: grayscale(1) brightness(1.05); }
 }
+:root[data-theme="dark"] .eye { filter: grayscale(1) brightness(1.05); }
+:root[data-theme="light"] .eye { filter: grayscale(1) brightness(0.72); }
+
 .head-meta { margin-left: auto; font-size: 0.78rem; color: var(--fg3); display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; }
 .head-meta .sep { color: var(--border); }
 .head-meta a { border-bottom: 0; }
@@ -331,11 +456,14 @@ header h1 {
 .hero { margin-bottom: 14px; }
 /* Plots first, then what they are about: the charts carry the measurement, the
    strip beneath names the failures behind it. */
-.hero-detail {
-  padding: 16px 24px 18px; display: flex; align-items: baseline;
-  justify-content: space-between; gap: 18px 24px; flex-wrap: wrap;
+.plot-foot {
+  padding: 14px 24px 16px; display: flex; align-items: baseline; min-width: 0;
+  justify-content: space-between; gap: 10px 16px; flex-wrap: wrap;
   border-top: 1px solid var(--border);
 }
+.plot-foot .rate { flex: 1 1 220px; }
+#rate-break { font-size: 0.82rem; color: var(--fg3); }
+#rate-break b { color: var(--fg2); font-weight: 600; }
 /* Heads on row 1, charts on row 2, both spanning the same grid. Each row is
    sized once for the whole row, so the two x axes share a baseline even if one
    head wraps to a second line. */
@@ -347,6 +475,15 @@ header h1 {
   .hero-plots { grid-template-columns: 1fr; }
   .col2 { border-left: 0; }
   .plot-head.col2 { border-top: 1px solid var(--border); padding-top: 18px; }
+  /* One column: each chart directly under its own title. In source order both
+     heads come first (they share a row on desktop), which on a phone put
+     "Risk index" and "Pass rate" together above two unlabelled charts. */
+  .hero-plots > :nth-child(1) { order: 1; }
+  .hero-plots > :nth-child(3) { order: 2; }
+  .hero-plots > :nth-child(5) { order: 3; }
+  .hero-plots > :nth-child(2) { order: 4; }
+  .hero-plots > :nth-child(4) { order: 5; }
+  .hero-plots > :nth-child(6) { order: 6; }
 }
 .badge {
   font-size: 2.1rem; font-weight: 700; line-height: 1; padding: 12px 20px;
@@ -364,32 +501,6 @@ details.working .dir {
 .gl { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; margin-bottom: 5px; max-width: 62ch; }
 .gl b { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track); font-size: 0.64rem; margin-right: 5px; }
 .rate .risk { font-size: 2.2rem; font-weight: 300; line-height: 1; letter-spacing: -0.02em; }
-table.weights th {
-  position: static; background: transparent; border-bottom: 1px solid var(--border);
-  padding: 4px 12px 4px 0; font-size: 0.6rem; color: var(--fg3);
-}
-table.weights td { padding: 4px 12px 4px 0; border-bottom: 1px solid var(--rule); font-size: 0.74rem; }
-table.weights tr.idle td { color: var(--fg3); }
-table.weights td.wc { text-transform: uppercase; letter-spacing: var(--track); font-weight: 700; font-size: 0.64rem; }
-table.weights tr.live td.wc { color: var(--fg); }
-table.weights td.ww, table.weights td.wn, table.weights td.wt {
-  font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; text-align: right;
-}
-/* Each contribution takes its own class colour, and the total takes the same
-   tone as the risk number heading the plot, so the two 24s are visibly the
-   same figure rather than two numbers that happen to match. */
-table.weights tr.live td.wt { font-weight: 700; }
-table.weights tr.fc-open td.wt, table.weights tr.fc-closed td.wt { color: var(--fail-ink); }
-table.weights tr.fc-degraded td.wt { color: var(--warn-ink); }
-table.weights tr.total td.wt.v-bad { color: var(--fail-ink); }
-table.weights tr.total td.wt.v-warn { color: var(--warn-ink); }
-table.weights tr.total td.wt.v-good { color: var(--pass-ink); }
-table.weights td.wd { color: var(--fg3); font-size: 0.7rem; }
-table.weights tr.total td { border-bottom: 0; border-top: 1px solid var(--fg3); font-weight: 700; color: var(--fg); }
-table.weights tr.total td.wt { font-size: 0.86rem; }
-table.weights tr.total td:first-child {
-  text-transform: uppercase; letter-spacing: var(--track); font-size: 0.62rem; color: var(--fg2); font-weight: 600;
-}
 .weights-note { font-size: 0.7rem; color: var(--fg3); line-height: 1.6; max-width: 58ch; }
 sup.cite { font-size: 0.58rem; font-weight: 600; margin-left: 3px; letter-spacing: 0; }
 a.tref {
@@ -417,7 +528,7 @@ a.fn-n:hover { border-bottom: 1px solid var(--fg); }
 }
 .fn { display: flex; gap: 8px; font-size: 0.7rem; line-height: 1.6; margin-bottom: 7px; max-width: 92ch; }
 .fn-n { flex: none; color: var(--fg2); font-weight: 700; font-variant-numeric: tabular-nums; }
-.fn a { word-break: break-all; }
+.fn a:not(.fn-n) { border-bottom: 1px solid var(--border); text-decoration: none; }
 .fn-note { display: block; color: var(--fg3); font-style: italic; }
 .foot-meta { font-size: 0.7rem; color: var(--fg3); }
 .fctag {
@@ -429,10 +540,10 @@ a.fn-n:hover { border-bottom: 1px solid var(--fg); }
    "how bad". Tinting by class made colour do both jobs and understated a
    blocks-the-run failure, which still breaks the consumer's pipeline. */
 tr.fc-open .fctag, tr.fc-closed .fctag { color: var(--fail-ink); }
-tr.fc-degraded .fctag { color: var(--warn-ink); }
+tr.fc-auxiliary .fctag { color: var(--warn-ink); }
 .cc { font-weight: 700; }
 .cc-open, .cc-closed { color: var(--fail-ink); }
-.cc-degraded { color: var(--warn-ink); }
+.cc-auxiliary { color: var(--warn-ink); }
 .dot-sep { color: var(--border); margin: 0 8px; font-weight: 400; }
 .classline {
   margin-top: 8px; font-size: 0.72rem; text-transform: uppercase;
@@ -497,16 +608,35 @@ details.working[open] > summary { margin-bottom: 8px; }
 .trend-svg { width: 100%; display: block; overflow: visible; }
 #risk-trend, #rate-trend { height: 108px; }
 .trend-head.second { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rule); }
-.method { padding: 18px 22px; margin-bottom: 26px; }
-.method-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(260px, 1fr); gap: 28px; align-items: start; }
-@media (max-width: 760px) { .method-grid { grid-template-columns: 1fr; gap: 16px; } }
-.method-defs { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; }
-.method-defs .gl { margin-bottom: 7px; max-width: none; }
-.method-defs .caveat {
-  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--rule); color: var(--fg3);
-}
-.method-defs .caveat b { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track); font-size: 0.64rem; }
-table.weights { width: 100%; max-width: none; border-collapse: collapse; margin: 0; }
+.method { padding: 0; margin: 26px 0 14px; }
+.method > summary { cursor: pointer; padding: 14px 22px; font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: var(--track); color: var(--fg3); list-style: none; }
+.method > summary::-webkit-details-marker { display: none; }
+.method > summary::before { content: '\25b8'; display: inline-block; width: 1.1em; }
+.method[open] > summary::before { content: '\25be'; }
+.method > summary:hover { color: var(--fg); }
+.method > #grade-note { padding: 4px 22px 18px; }
+.stat-name .info { color: var(--fg3); text-decoration: none; border: none; font-size: 0.95em;
+  margin-left: 3px; text-transform: none; }
+.stat-name .info:hover { color: var(--fg); }
+.statline { font-weight: 400; color: var(--fg3); line-height: 1.6; }
+.statline b { color: var(--fg); font-weight: 600; }
+.statline .tn { color: var(--fg2); }
+.statline .tw { color: var(--fg3); }
+.statline .term { white-space: nowrap; }
+.formula { font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; font-size: 0.8rem;
+  color: var(--fg); margin: 2px 0 14px; }
+.formula .mhint { font-family: inherit; color: var(--fg3); font-size: 0.7rem; margin-left: 8px; }
+.mdefs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.72rem;
+  line-height: 1.6; color: var(--fg3); margin-bottom: 12px; }
+.mdefs .mk { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track);
+  font-size: 0.64rem; font-weight: 700; white-space: nowrap; padding-top: 1px; }
+.mdefs .mk .mw { font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; margin-left: 6px;
+  color: var(--fg3); font-weight: 400; letter-spacing: 0; }
+.mcaveat { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; max-width: 92ch;
+  padding-top: 10px; border-top: 1px solid var(--rule); margin-bottom: 12px; }
+.mrefs .fn { margin-bottom: 5px; }
+@media (max-width: 560px) { .mdefs { grid-template-columns: 1fr; gap: 2px; } .mdefs .mk { padding-top: 8px; } }
 .ax-grid { stroke: var(--rule); stroke-width: 1; }
 .ax-lbl { font-size: 9px; fill: var(--fg3); font-family: inherit; letter-spacing: 0.04em; }
 .pt-lbl { font-size: 9px; font-weight: 600; fill: var(--fg3); font-family: inherit; }
@@ -611,35 +741,39 @@ td.c-lnk a { margin-left: 10px; border-bottom: 0; color: var(--fg3); }
 td.c-lnk a:hover { color: var(--fg); border-bottom: 1px solid var(--fg); }
 tr.t.fc-open td, tr.t.fc-closed td { background: var(--fail-bg); }
 tr.t.fc-open td.c-st, tr.t.fc-closed td.c-st { box-shadow: inset 3px 0 0 var(--fail); }
-tr.t.fc-degraded td { background: var(--warn-bg); }
-tr.t.fc-degraded td.c-st { box-shadow: inset 3px 0 0 var(--warn); }
+tr.t.fc-auxiliary td { background: var(--warn-bg); }
+tr.t.fc-auxiliary td.c-st { box-shadow: inset 3px 0 0 var(--warn); }
 tr.hidden { display: none; }
 mark { background: rgba(240,173,78,0.28); color: inherit; padding: 0 2px; }
 .empty { padding: 44px 12px; text-align: center; color: var(--fg3); font-size: 0.85rem; }
 .none { color: var(--fg3); }
+.chip { display:inline-block; padding:1px 7px; border:1px solid var(--border); font-size:0.68rem;
+        font-weight:600; letter-spacing:0.04em; text-transform:uppercase; white-space:nowrap; cursor:help; }
+.chip-warn { color: var(--warn-ink); background: var(--warn-bg); border-color: var(--warn); }
+.chip-ok   { color: var(--pass-ink); background: var(--pass-bg); border-color: var(--pass); }
+/* Deep-linking to a row put it under the sticky table header: the browser
+   scrolls the anchor to y=0 and the header then sits on top of it. This is
+   what scroll-margin-top is for -- no JS, and it fixes keyboard navigation and
+   a reload on an existing #hash at the same time. Applied to any element that
+   can be a link target. */
+tr[id], [id^="ref-"], [id^="cite-"], section[id] { scroll-margin-top: 92px; }
+/* A brief tint so the reader can see WHICH row they landed on, since the row
+   is no longer at the very top of the viewport. */
+:target > td { animation: land 1.4s ease-out 1; }
+@keyframes land { from { background: var(--warn-bg); } to { background: transparent; } }
 footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--fg3); }
 
-/* theme toggle */
-.theme-toggle {
-  background: transparent; border: 1px solid var(--border); border-radius: var(--radius);
-  color: var(--fg3); font: inherit; font-size: 0.64rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: var(--track); padding: 4px 9px; cursor: pointer;
-}
-.theme-toggle:hover { border-color: var(--primary); color: var(--fg); }
 </style>
 </head>
 <body>
 <div class="container">
-  <header>
-    <h1>Argus Test Suite</h1>
-    <div class="head-meta" id="head-meta"></div>
-    <button class="theme-toggle" id="theme-toggle" type="button" title="Switch theme"></button>
-  </header>
+  <div class="nav" id="nav"></div>
+  <div class="pmeta" id="head-meta"></div>
 
   <section class="card hero">
     <div class="hero-plots">
       <div class="plot-head">
-        <span class="stat-name" id="risk-label">Risk index</span>
+        <span class="stat-name" id="risk-label">Risk index <a class="info" href="#how" title="How the risk index is calculated" aria-label="How the risk index is calculated">&#9432;</a></span>
         <span class="stat-num" id="risk-num"></span>
         <span class="stat-sub" id="risk-sub">lower is better</span>
         <span class="delta" id="risk-delta"></span>
@@ -652,14 +786,13 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
       </div>
       <div class="plot-body"><svg id="risk-trend" class="trend-svg"></svg></div>
       <div class="plot-body col2"><svg id="rate-trend" class="trend-svg"></svg></div>
-    </div>
-    <div class="hero-detail">
-      <span class="rate" id="rate"></span>
-      <div class="stats" id="stats"></div>
+      <!-- What each number is made of, under its own chart: the verdict and the
+           risk arithmetic belong to the risk index, and "not run" moves the
+           pass rate, not the risk. -->
+      <div class="plot-foot"><span class="rate" id="rate"></span><div class="stats" id="stats"></div></div>
+      <div class="plot-foot col2"><span class="rate" id="rate-break"></span><div class="stats" id="stats2"></div></div>
     </div>
   </section>
-
-  <section class="card method" id="grade-note"></section>
 
   <section class="card search">
     <div class="search-row">
@@ -683,6 +816,14 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
     <tbody id="rows"></tbody>
   </table>
   <div class="empty" id="empty" style="display:none"></div>
+
+  <!-- Reference material, so it sits after the tests rather than between the
+       headline and them. Collapsed, but one click from the number it explains
+       (the info mark beside "Risk index" opens it). -->
+  <details class="card method" id="how">
+    <summary>How the risk index is calculated</summary>
+    <div id="grade-note"></div>
+  </details>
 
   <footer id="foot"></footer>
 </div>
@@ -711,18 +852,37 @@ HTMLEOF
   echo "  selfSha: \"${SELF_SHA:-main}\","
   printf '  categories: %s,\n' "$CATEGORIES"
   printf '  gaps: %s,\n' "$GAPS_JSON"
+  printf '  retiredGaps: %s,\n' "$RETIRED_JSON"
+  printf '  liveness: %s,\n' "$LIVENESS_JSON"
   printf '  failureClasses: %s,\n' "$CLASSES_JSON"
   printf '  catalog: %s,\n' "$CATALOG_JSON"
   printf '  jobs: %s,\n' "${JOBS_JSON:-[]}"
+  printf '  branches: %s,\n' "${BRANCHES_JSON:-[]}"
+  echo "  branchName: \"${BRANCH_NAME:-}\","
+  echo "  branchSlug: \"${BRANCH_SLUG:-}\","
   printf '  history: %s\n' "$HISTORY_DATA"
   echo "};"
 } >> "$OUT/index.html"
 
 cat >> "$OUT/index.html" << 'HTMLEOF2'
 
+__NAV_JS__
 (function () {
   const d = DATA;
   const server = d.runUrl.split('/').slice(0, 3).join('/');
+  // The argus version under test: the release when the ref is main, the ref
+  // otherwise, and always the exact commit -- the link cannot move.
+  const aSha = d.argusSha && d.argusSha !== 'unknown' ? String(d.argusSha).slice(0, 7) : '';
+  const onMain = (d.argusRef || 'main') === 'main';
+  const aHref = d.argusRepo ? server + '/' + d.argusRepo +
+                (aSha ? '/commit/' + d.argusSha : '/tree/' + (d.argusRef || 'main')) : '';
+  renderNav({ el: 'nav', branch: d.branchName || d.branchSlug || 'branch',
+              slug: d.branchSlug || d.branchName, sha: d.selfSha, page: 'tests',
+              branches: d.branches || [], up: '../',
+              argus: d.argusRepo ? { version: onMain && d.argusVersion ? 'v' + d.argusVersion
+                                                    : (d.argusRef || 'main'),
+                                     sha: aSha, href: aHref } : null,
+              run: { date: d.date, href: d.runUrl } });
   const repoUrl = server + '/' + d.repo;
   const srcBase = repoUrl + '/blob/' + (d.selfSha || 'main') + '/';
 
@@ -740,37 +900,23 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
 
   // ---------------------------------------------------------------- header
   var meta = [];
-  // On main, every push cuts a release, so the ref, the version and the commit
-  // all say the same thing -- collapse to the version and keep the exact commit
-  // in the link target and tooltip so no precision is lost. On any other ref a
-  // version number would be a lie (the branch predates or postdates the release
-  // it reports), so fall back to naming the ref and its commit.
-  if (d.argusRepo) {
-    const onMain = (d.argusRef || 'main') === 'main';
-    const known = d.argusSha && d.argusSha !== 'unknown';
-    if (onMain && d.argusVersion) {
-      const el = '<a href="' + server + '/' + d.argusRepo + '/releases/tag/' + esc(d.argusVersion) + '"' +
-                 (known ? ' title="commit ' + esc(d.argusShaShort) + '"' : '') +
-                 '>argus <span class="mono">v' + esc(d.argusVersion) + '</span></a>';
-      meta.push(el);
-    } else if (known) {
-      meta.push('<a href="' + server + '/' + d.argusRepo + '/tree/' + esc(d.argusRef) + '">argus@' + esc(d.argusRef) + '</a>' +
-                ' <a class="mono" href="' + server + '/' + d.argusRepo + '/commit/' + d.argusSha + '">' + esc(d.argusShaShort) + '</a>');
-    } else {
-      meta.push('argus@' + esc(d.argusRef || 'main'));
-    }
-  }
-  meta.push(esc(d.date));
-  meta.push('scope <span class="mono">' + esc(d.scope) + '</span>');
-  meta.push('<a href="' + d.runUrl + '">view run &#8599;</a>');
-  $('head-meta').innerHTML = meta.join('<span class="sep">&middot;</span>');
+  // The run's metadata line under the nav; renderHeader lives in site-nav.sh.
+  renderHeader({
+    metaEl: 'head-meta', up: '__UP__',
+    selfRepo: d.repo, selfSha: d.selfSha,
+    argusRepo: d.argusRepo, argusRef: d.argusRef,
+    argusSha: d.argusSha, argusVersion: d.argusVersion,
+    liveness: d.liveness, date: d.date, scope: d.scope, runUrl: d.runUrl
+  });
 
   // ---------------------------------------------------------------- corpus
   const ran = {};
   d.categories.forEach(function (cat) {
     cat.tests.forEach(function (t) {
+      // reason and class ride along: the row below reads r.reason, which was
+      // never copied here, so a skip's explanation never reached the board.
       ran[t.id] = { status: t.status, category: cat.name, detail: t.detail,
-                    checks: t.checks, stats: t.stats };
+                    checks: t.checks, stats: t.stats, reason: t.reason, cls: t.class };
     });
   });
   const docs = [];
@@ -782,6 +928,8 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
       kind: 'test', id: c.id, name: c.name,
       question: (r && r.detail) || c.question || '',
       status: r ? r.status : 'notrun',
+      reason: r ? (r.reason || '') : '',
+      failclass: r ? (r.cls || '') : '',
       category: c.category || (r && r.category),
       file: c.file || '', line: c.line || null, why: '', scope: c.scope || 'all',
       checks: (r && r.checks) || c.checks || null,
@@ -792,7 +940,7 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
     cat.tests.forEach(function (t) {
       if (seen[t.id]) return;
       docs.push({
-        kind: 'test', id: t.id, name: t.name, question: t.detail || '',
+        kind: 'test', id: t.id, name: t.name, question: t.detail || '', failclass: t.class || '',
         status: t.status, category: cat.name, file: '', line: null, why: '',
         checks: t.checks || null, stats: t.stats || null
       });
@@ -848,8 +996,11 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
 
 
   // ------------------------------------------------------------------ hero
-  const ranCount = nPass + nFail;
-  const rate = ranCount ? Math.round((nPass / ranCount) * 100) : 0;
+  // The one pass rate: passed / defined, rounded down -- the same figure the
+  // generator stores as pct_defined and the index shows. histPct reads it from
+  // a history entry; entries written before it existed fall back to `rate`.
+  function histPct(p) { return p.pct_defined != null ? p.pct_defined : p.rate; }
+  const rate = tests.length ? Math.floor((nPass / tests.length) * 100) : 0;
 
   // ---- verdict + risk ------------------------------------------------------
   // Binary verdict, because a contract suite is a conformance oracle: an
@@ -864,7 +1015,7 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   // Weights come from .github/data/failure-classes.json and rank a control that
   // fails OPEN above one that fails CLOSED, because only the first lies to you.
   const FC = d.failureClasses || null;
-  const W = (FC && FC.weights) || { open: 10, closed: 3, degraded: 1 };
+  const W = (FC && FC.weights) || { open: 10, closed: 3, auxiliary: 1 };
   const CLASS_OF = {};
   if (FC && FC.classes) {
     Object.keys(FC.classes).forEach(function (k) {
@@ -872,10 +1023,15 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
     });
   }
   const DEFAULT_CLASS = (FC && FC.default) || 'closed';
-  function failClass(x) { return CLASS_OF[x.id] || DEFAULT_CLASS; }
+  // A test that can fail more than one way reports which (N3, N5); that wins
+  // over the fixed class in failure-classes.json, which cannot know.
+  function failClass(x) {
+    return (x.failclass && W[x.failclass] != null) ? x.failclass : (CLASS_OF[x.id] || DEFAULT_CLASS);
+  }
 
   const failing = tests.filter(function (x) { return x.status === 'FAIL'; });
-  const byClass = { open: [], closed: [], degraded: [] };
+  const byClass = {};
+  Object.keys(W).forEach(function (k) { byClass[k] = []; });
   failing.forEach(function (x) {
     const c = failClass(x);
     (byClass[c] = byClass[c] || []).push(x);
@@ -883,16 +1039,24 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   var risk = 0;
   Object.keys(byClass).forEach(function (c) { risk += (W[c] || 0) * byClass[c].length; });
 
-  const ORDER = ['open', 'closed', 'degraded'];
-  const LBL = (FC && FC.labels) || { open: 'fail-open', closed: 'fail-closed', degraded: 'degraded' };
+  // Severity order is DERIVED from the weights, descending, so a class added
+  // or renamed in failure-classes.json cannot be left unranked here. It was a
+  // hardcoded ['open','closed','degraded'] until 'auxiliary' was added, at
+  // which point a run whose only failures were auxiliary computed worst='none'
+  // and the board reported PASS with tests failing -- the exact silent pass
+  // this suite exists to catch, in the thing that reports it.
+  const ORDER = Object.keys(W).sort(function (a, b) { return (W[b] || 0) - (W[a] || 0); });
+  const LBL = (FC && FC.labels) || { open: 'fail-open',
+                                     closed: 'fail-closed',
+                                     auxiliary: 'auxiliary breakage' };
   const SHORT = (FC && FC.short) || LBL;
   const GLOSS = (FC && FC.glossary) || {};
   const REFS = (FC && FC.references) || [];
   const IDX = (FC && FC.index) || { name: 'Risk', anchor: '0 = clean' };
   const STATUS = (FC && FC.status) || {
-    open: { word: 'FAIL', tone: 'bad', line: 'tests report success without scanning' },
-    closed: { word: 'FAIL', tone: 'bad', line: 'argus refuses to run where it should work' },
-    degraded: { word: 'FAIL', tone: 'warn', line: 'an auxiliary path is broken' },
+    open: { word: 'FAIL', tone: 'bad', line: 'argus reports success without running the check it was asked for' },
+    closed: { word: 'FAIL', tone: 'bad', line: 'argus errors out where it should succeed -- the pipeline stops, nothing gets through' },
+    auxiliary: { word: 'FAIL', tone: 'warn', line: 'an auxiliary path is broken; scans and gates still work' },
     none: { word: 'PASS', tone: 'good', line: 'every defined test that ran, passed' }
   };
 
@@ -900,17 +1064,17 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   // needs no arithmetic and makes no claim that the classes are commensurable,
   // which a weighted sum silently does. One fail-open is disqualifying for a
   // security gate however many other tests pass.
-  const pctPass = tests.length ? Math.round((nPass / tests.length) * 100) : 0;
+  const pctPass = rate;
   const worst = ORDER.filter(function (c) { return (byClass[c] || []).length; })[0] || 'none';
   const st = Object.assign({}, STATUS[worst] || STATUS.none);
   // No verdict badge: a non-zero risk already says the run failed, and the
   // sentence below says what failed. A FAIL chip next to a red 24 is the same
   // fact twice.
-  if (worst === 'open') {
-    const ids = (byClass.open || []).map(function (x) { return x.id; });
-    st.line = ids.length + ' test' + (ids.length === 1 ? '' : 's') +
-              ' report success without scanning. See ' + testLinks(ids) + '.';
-  }
+  // The sentence says what the worst class means, in the glossary's terms;
+  // which tests, and what each cost, follows it as the risk arithmetic. (It
+  // used to append "N tests report success without scanning. See …" -- which
+  // named the tests twice and was not true of N5, which did scan: the wrong
+  // architecture.)
 
   // Risk carries the severity colour because that is what it measures. Pass
   // rate stays neutral: it is a breadth figure, and 95% is neither good nor bad
@@ -927,8 +1091,40 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   $('rate-num').textContent = pctPass + '%';
   $('rate-num').className = 'stat-num';
   $('rate-sub').textContent = nPass + '/' + tests.length;
+  $('rate-break').innerHTML = '<b>' + nPass + '</b> passed \u00b7 <b>' + nFail + '</b> failed \u00b7 <b>' +
+    nIdle + '</b> not run';
 
-  $('rate').innerHTML = '<div class="statline">' + st.line + '</div>';
+  // The index's working, beside the sentence it qualifies: which tests produced
+  // the number and what each cost. Named per test while that stays short; past
+  // six it is summed per class instead, and the full table is under "How the
+  // risk index is calculated".
+  var riskCosts = [];
+  ORDER.forEach(function (c) {
+    (byClass[c] || []).forEach(function (x) { riskCosts.push({ id: x.id, name: x.name, w: W[c] || 0 }); });
+  });
+  // The strip says WHAT failed, not what the worst class means: the class is
+  // on the chips (definition in the tooltip), and a sentence restating it --
+  // "argus reports success without running the check it was asked for" --
+  // told the reader nothing about this run. Each term names the test, so an
+  // id is not the only clue.
+  var riskSum;
+  if (risk > 0) {
+    var riskTerms = riskCosts.length <= 6
+      ? riskCosts.map(function (f) {
+          // One unbreakable term per test, so a wrap falls between terms and
+          // never strands a weight on its own line.
+          return '<span class="term">' + testLink(f.id) +
+                 (f.name ? ' <span class="tn">' + esc(f.name) + '</span>' : '') +
+                 ' <span class="tw">(' + f.w + ')</span></span>';
+        })
+      : ORDER.filter(function (c) { return (byClass[c] || []).length; }).map(function (c) {
+          return (byClass[c] || []).length + ' ' + esc(SHORT[c] || LBL[c] || c) + ' \u00d7 ' + (W[c] || 0);
+        });
+    riskSum = 'risk <b>' + risk + '</b> = ' + riskTerms.join(' + ');
+  } else {
+    riskSum = 'risk <b>0</b>: no failures';
+  }
+  $('rate').innerHTML = '<div class="statline">' + riskSum + '</div>';
 
   // Bracketed markers link to their footnote, and each footnote links back to
   // the marker that cited it. A citation you cannot follow is decoration.
@@ -938,45 +1134,49 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   }
   function testLinks(ids) { return ids.map(testLink).join(', '); }
 
+  const citedOnce = {};
   function citeMark(ns) {
     return '<sup class="cite">' + ns.map(function (n) {
-      return '<a id="cite-' + n + '" href="#ref-' + n + '">[' + n + ']</a>';
+      // Only the first mark carries the id a reference's back-link targets.
+      const id = citedOnce[n] ? '' : ' id="cite-' + n + '"';
+      citedOnce[n] = true;
+      return '<a' + id + ' href="#ref-' + n + '">[' + n + ']</a>';
     }).join(', ') + '</sup>';
   }
 
-  var rows = '';
-  ORDER.forEach(function (c) {
-    const n = (byClass[c] || []).length, w = W[c] || 0;
-    const ids = testLinks((byClass[c] || []).map(function (x) { return x.id; }));
-    rows += '<tr class="' + (n ? 'live fc-' + c : 'idle') + '">' +
-      '<td class="wc" title="' + esc(GLOSS[c] || '') + '">' + esc(LBL[c] || c) +
-        (c === 'open' ? citeMark([1, 2]) : '') + '</td>' +
-      '<td class="ww">&times;' + w + '</td>' +
-      '<td class="wn">' + n + '</td>' +
-      '<td class="wt">' + (n * w) + '</td>' +
-      '<td class="wd">' + (ids || '&mdash;') + '</td></tr>';
-  });
-  const glossHtml = ORDER.map(function (c) {
-    return '<div class="gl"><b>' + esc(LBL[c] || c) + '</b> ' + esc(GLOSS[c] || '') + '</div>';
+  // What the strip under the chart does not already say: the weights, what
+  // each class means, and what the sources do and do not support. The counts
+  // and the tests are on the strip (risk N = A (w) + B (w)), so a table
+  // repeating them here was noise.
+  const formula = 'risk = ' + ORDER.map(function (c) {
+    return (W[c] || 0) + ' &times; ' + esc(SHORT[c] || LBL[c] || c);
+  }).join(' + ') + '<span class="mhint">summed over failing tests</span>';
+  const defs = ORDER.map(function (c) {
+    return '<span class="mk">' + esc(LBL[c] || c) + '<span class="mw">&times;' + (W[c] || 0) + '</span></span>' +
+           '<span>' + esc(GLOSS[c] || '') + (c === 'open' ? citeMark([1, 2]) : '') + '</span>';
   }).join('');
-
-  // Table and definitions sit side by side, both always visible: a number is
-  // only checkable if its working and its terms are on screen together.
+  // The data file already separates what is cited from what is not; the page
+  // says so too, so the numbers are not read as coming from the literature.
+  const caveat = 'That failing open is worse than failing closed is grounded in the sources' +
+    citeMark([1, 2]) + '; the numbers 10 / 3 / 1 are this suite\u2019s judgement, not a measurement. ' +
+    esc(IDX.caveat || '') + ' Each test is pass/fail rather than scored' + citeMark([3]) + '.';
+  // References live with the claims they support. The title is the link:
+  // printing the URL beside it repeated the destination in a form nobody reads.
+  const refs = REFS.map(function (r) {
+    return '<div class="fn" id="ref-' + r.n + '">' +
+           '<a class="fn-n" href="#cite-' + r.n + '" title="back to where this is cited">[' + r.n + ']</a>' +
+           '<span><a href="' + esc(r.url) + '">' + esc(r.ieee || r.cite || '') + '</a>' +
+           (r.note ? '<span class="fn-note">' + esc(r.note) + '</span>' : '') + '</span></div>';
+  }).join('');
   $('grade-note').innerHTML =
-    '<div class="method-grid">' +
-    '<div><table class="weights"><thead><tr>' +
-      '<th>failure class</th><th>per failure</th><th>n</th><th>weight</th><th>tests</th>' +
-    '</tr></thead><tbody>' + rows +
-    '<tr class="total"><td colspan="3">risk index = &Sigma; weight</td>' +
-    '<td class="wt v-' + (st.tone || 'good') + '">' + risk + '</td><td></td></tr></tbody></table></div>' +
-    '<div class="method-defs">' + glossHtml +
-      '<div class="caveat"><b>On the index.</b> ' + esc(IDX.caveat || '') +
-      ' Each test is itself pass/fail rather than scored' + citeMark([3]) + '.</div>' +
-    '</div></div>';
+    '<div class="formula">' + formula + '</div>' +
+    '<div class="mdefs">' + defs + '</div>' +
+    '<div class="mcaveat">' + caveat + '</div>' +
+    (refs ? '<div class="mrefs footnotes"><div class="fn-head">References</div>' + refs + '</div>' : '');
 
   const hist = d.history || [];
   if (hist.length >= 2) {
-    const prev = hist[hist.length - 2].rate;
+    const prev = histPct(hist[hist.length - 2]);
     const diff = rate - prev;
     const el = $('delta');
     el.className = 'delta ' + (diff > 0 ? 'up' : diff < 0 ? 'down' : '');
@@ -984,13 +1184,22 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
       : (diff > 0 ? '\u25b2 +' : '\u25bc ') + diff + ' pts vs last run';
   }
 
-  const STAT_DEFS = [
-    { key: 'not-run', cls: 'idle', label: 'not run', n: nIdle },
-    { key: 'fail-open', cls: 'fail', label: SHORT.open || 'reports success', n: (byClass.open || []).length },
-    { key: 'fail-closed', cls: 'fail', label: SHORT.closed || 'blocks', n: (byClass.closed || []).length },
-    { key: 'degraded', cls: 'warn', label: SHORT.degraded || 'degraded', n: (byClass.degraded || []).length }
-  ];
-  const statsEl = $('stats');
+  // One chip per class, in severity order, so a class added to
+  // failure-classes.json appears without editing this list.
+  const FILTER_KEY = { open: 'fail-open', closed: 'fail-closed' };
+  // What "not run" does to the numbers is the one thing a reader cannot see
+  // from the counts, so the chip says it: it lowers the pass rate (the test
+  // was not verified) but not the risk index (only failures score).
+  const STAT_DEFS = [{ key: 'not-run', cls: 'idle', label: 'not run', n: nIdle,
+    gloss: 'Defined but not run this time. Counts against the pass rate (it was not verified), not the risk index.' }].concat(
+    ORDER.map(function (c) {
+      return { key: FILTER_KEY[c] || c,
+               cls: (c === 'auxiliary' ? 'warn' : 'fail'),
+               label: SHORT[c] || LBL[c] || c,
+               gloss: (LBL[c] ? LBL[c] + ' \u2014 ' : '') + (GLOSS[c] || ''),
+               n: (byClass[c] || []).length };
+    }));
+  const statsEl = $('stats'), stats2El = $('stats2');
   STAT_DEFS.forEach(function (s) {
     if (s.n === 0 && s.key !== 'all') return;
     const b = document.createElement('button');
@@ -998,12 +1207,16 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
     b.type = 'button';
     b.dataset.filter = s.key;
     b.setAttribute('aria-pressed', s.key === 'all' ? 'true' : 'false');
+    // The label alone is a two-word abbreviation of a whole failure class.
+    // "scanned less than asked" means nothing without the sentence behind it,
+    // so the glossary entry rides along as the tooltip.
+    b.title = (s.gloss ? s.gloss + ' ' : '') + '(click to show only these tests)';
     b.innerHTML = '<b>' + s.n + '</b> ' + s.label;
     b.addEventListener('click', function () { toggleFilter(s.key); });
-    statsEl.appendChild(b);
+    (s.key === 'not-run' ? stats2El : statsEl).appendChild(b);
   });
   function syncStats(active) {
-    Array.prototype.forEach.call(statsEl.children, function (b) {
+    Array.prototype.forEach.call([].slice.call(statsEl.children).concat([].slice.call(stats2El.children)), function (b) {
       const k = b.dataset.filter;
       const on = active.indexOf(k) > -1;
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
@@ -1028,7 +1241,8 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   // reads correctly for it, then pass rate for breadth. Older history entries
   // predate the risk field, so that series plots only the points that have one.
   const riskHist = hist.filter(function (p) { return typeof p.risk === 'number'; });
-  $('risk-label').textContent = 'Risk index';
+  // The label keeps its info mark, so only the text node is (re)set.
+  $('risk-label').firstChild.nodeValue = 'Risk index ';
   if (riskHist.length >= 2) {
     const rPrev = riskHist[riskHist.length - 2].risk, rNow = riskHist[riskHist.length - 1].risk;
     const rd = rNow - rPrev, el = $('risk-delta');
@@ -1106,7 +1320,7 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
       r.addEventListener('mouseenter', function (e) {
         const p = data[+r.dataset.i];
         tip.innerHTML = '<b>' + esc(p.date) + '</b><br>' + p.verdict + ' &middot; ' +
-          p.passed + '/' + p.total + ' (' + p.rate + '%)' +
+          p.passed + '/' + (p.defined != null ? p.defined : p.total) + ' (' + histPct(p) + '%)' +
           (typeof p.risk === 'number' ? '<br>risk ' + p.risk : '');
         tip.style.display = 'block';
         tip.style.left = (e.clientX + window.scrollX + 12) + 'px';
@@ -1135,10 +1349,10 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
     // and 90s, starting at 0 leaves most of the panel empty. The floor is
     // rounded down to a step and LABELLED, so the truncation is visible rather
     // than quietly exaggerating the slope.
-    const rates = hist.map(function (p) { return p.rate; });
+    const rates = hist.map(histPct);
     const lo = rates.length ? Math.min.apply(null, rates) : 0;
     const rFloor = Math.max(0, Math.min(90, Math.floor((lo - 2) / 10) * 10));
-    drawSeries('rate-trend', hist, function (p) { return p.rate; },
+    drawSeries('rate-trend', hist, histPct,
                { min: rFloor, max: 100,
                  ticks: [rFloor, Math.round((rFloor + 100) / 2), 100], muted: true });
   }
@@ -1280,10 +1494,24 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   }
   // A not-run test is a scheduling decision, not a defect: say which scope runs it.
   function notRunNote(x) {
-    if (x.kind !== 'test' || x.status !== 'notrun') return '';
-    return x.scope && x.scope !== 'all'
-      ? 'Runs only when the suite is dispatched with scope=' + x.scope + '.'
-      : 'Not run in this scope.';
+    if (x.kind !== 'test') return '';
+    // A test that produced no verdict has to say why. "Not run" on its own is
+    // the shape this suite rejects everywhere else: it makes "we did not look"
+    // and "there is nothing wrong" read the same. The reason travels with the
+    // result when the test knows it; scope and cancellation are inferred.
+    if (x.reason) return x.reason;
+    if (x.status === 'skip')   return 'Skipped: this test declined to run and did not say why. That is a gap in the test, not a result.';
+    if (x.status === 'cancel') return 'Cancelled before it could report -- the run was superseded or stopped, so this is not a verdict either way.';
+    if (x.status !== 'notrun') return '';
+    if (x.scope && x.scope !== 'all') {
+      return 'Runs only when the suite is dispatched with scope=' + x.scope + '.';
+    }
+    // "Not run in this scope" was circular when the scope WAS all: it restated
+    // the status and explained nothing. A test the suite defines, in a scope
+    // that should have run it, producing no result means the run never got to
+    // it -- which is a fact about the run, and worth saying.
+    return 'This scope should have run it, but the run reported no result \u2014 ' +
+           'its category most likely failed to start or was cancelled.';
   }
   function srcHref(x) {
     if (x.issue) return repoUrl + '/issues/' + x.issue;   // a gap points at its issue
@@ -1411,7 +1639,7 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
     },
     'fail-open': function (x) { return x.kind === 'test' && x.status === 'FAIL' && failClass(x) === 'open'; },
     'fail-closed': function (x) { return x.kind === 'test' && x.status === 'FAIL' && failClass(x) === 'closed'; },
-    degraded: function (x) { return x.kind === 'test' && x.status === 'FAIL' && failClass(x) === 'degraded'; },
+    auxiliary: function (x) { return x.kind === 'test' && x.status === 'FAIL' && failClass(x) === 'auxiliary'; },
     tests: function (x) { return x.kind === 'test'; },
     gap: function (x) { return x.kind === 'gap'; },
     untested: function (x) { return x.kind === 'untested'; },
@@ -1630,34 +1858,22 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
   });
 
   $('foot').innerHTML =
-    '<div class="footnotes"><div class="fn-head">References</div>' +
-    REFS.map(function (r) {
-      return '<div class="fn" id="ref-' + r.n + '">' +
-             '<a class="fn-n" href="#cite-' + r.n + '" title="back to where this is cited">[' + r.n + ']</a>' +
-             '<span>' + esc(r.ieee || r.cite || '') +
-             ' <a href="' + esc(r.url) + '">' + esc(r.url) + '</a>' +
-             (r.note ? '<span class="fn-note">' + esc(r.note) + '</span>' : '') + '</span></div>';
-    }).join('') + '</div>' +
     '<div class="foot-meta">Generated by the test suite CI on every push. ' +
     'Weights live in <span class="mono">.github/data/failure-classes.json</span>; ' +
-    'coverage gaps in <span class="mono">.github/data/coverage-gaps.json</span>.</div>';
+    'coverage gaps in <span class="mono">.github/data/coverage-gaps.json</span>; ' +
+    '<a href="__UP__../">All branches</a>.</div>';
 
-  // Theme: follow the OS by default, let the reader override, remember it.
-  // Storage can throw in private windows, so every access is guarded.
-  const root = document.documentElement;
-  const tbtn = $('theme-toggle');
-  function readTheme() { try { return localStorage.getItem('argus-theme') || 'auto'; } catch (e) { return 'auto'; } }
-  function applyTheme(mode) {
-    if (mode === 'auto') root.removeAttribute('data-theme');
-    else root.setAttribute('data-theme', mode);
-    tbtn.textContent = mode === 'auto' ? 'Auto' : mode === 'dark' ? 'Night' : 'Day';
-    try { localStorage.setItem('argus-theme', mode); } catch (e) {}
-  }
-  applyTheme(readTheme());
-  tbtn.addEventListener('click', function () {
-    const order = ['auto', 'light', 'dark'];
-    applyTheme(order[(order.indexOf(readTheme()) + 1) % order.length]);
+  // Links into the collapsed method section -- the info mark, or a reference's
+  // back-link to a citation inside it -- open it first, or they land on nothing.
+  document.addEventListener('click', function (e) {
+    const a = e.target && e.target.closest && e.target.closest('a[href^="#"]');
+    if (!a) return;
+    const how = $('how');
+    const t = document.querySelector(a.getAttribute('href'));
+    if (how && t && (t === how || how.contains(t))) how.open = true;
   });
+
+  // The theme control lives in the nav (initTheme in site-nav.sh).
 
   // The URL carries the whole query, `is:` tokens included, so a filtered view
   // is a shareable link rather than something you have to re-click.
@@ -1674,13 +1890,19 @@ HTMLEOF2
 # argus's eye as the site icon, copied next to the page so it needs no network
 FAVICON_SRC="$SCRIPT_DIR/../data/argus-favicon.png"
 if [ -f "$FAVICON_SRC" ]; then
-  cp "$FAVICON_SRC" "$OUT/favicon.png"
+  cp "$FAVICON_SRC" "$SHARED_DIR/favicon.png"
 else
   echo "WARNING: $FAVICON_SRC missing - the page will fall back to no icon"
 fi
 
 # .nojekyll
-touch "$OUT/.nojekyll"
+touch "$SHARED_DIR/.nojekyll"
+
+# Resolve the relative-path placeholder as a post-pass, so the HTML heredocs
+# above stay literal and greppable.
+sed -i.bak "s|__UP__|${UP}|g" "$OUT/index.html" && rm -f "$OUT/index.html.bak"
+
+splice_nav "$OUT/index.html"
 
 echo "Dashboard generated: $OUT/index.html"
 echo "History entries: $(jq 'length' "$HISTORY_FILE")"

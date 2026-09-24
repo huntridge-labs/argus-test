@@ -1,13 +1,28 @@
 name: "argus hardening run (dispatch target)"
 run-name: "argus ${{ inputs.marker }}"
+
+# One job per enumerated argus ref -- `uses:` cannot take an expression. The
+# enumeration lives in .github/data/argus-refs.json; I4 fails on drift, and
+# guard-ref refuses anything unlisted rather than falling through to main.
+#
+# LIVENESS WARNING, specific to this target: reusable-security-hardening.yml
+# pins EVERY nested scanner workflow at its release tag, including
+# `container-scan.yml@1.12.5`. So calling this at a branch gets you the
+# branch's dispatch/validation logic on top of RELEASED scanners -- the
+# container scan underneath is 1.12.5 even on a branch run. Run
+# .github/scripts/audit-ref-liveness.sh to see the full list; the dashboard
+# prints the split next to the ref under test.
+
 on:
   workflow_dispatch:
     inputs:
       marker:      { required: true,  type: string }
+      argus_ref:   { required: false, type: string, default: 'main' }
       scanners:    { required: false, type: string, default: 'all' }
       iac_path:    { required: false, type: string, default: '' }
       allow_failure:   { required: false, type: boolean, default: true }
       post_pr_comment: { required: false, type: boolean, default: false }
+
 # Must be a superset of what reusable-security-hardening.yml declares, or the
 # call fails at startup with no jobs and no annotation.
 permissions:
@@ -18,8 +33,28 @@ permissions:
   pull-requests: write
   checks: write
   id-token: write
+
 jobs:
-  scan:
+  guard-ref:
+    name: "guard: argus_ref is enumerated"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          ARGUS_REF: ${{ inputs.argus_ref }}
+        run: |
+          set -euo pipefail
+          if ! jq -r '.refs[].ref' .github/data/argus-refs.json | grep -Fxq "$ARGUS_REF"; then
+            echo "::error title=Unenumerated argus_ref::'$ARGUS_REF' is not in .github/data/argus-refs.json, so no job here would run and this dispatch would still conclude 'success' over a scan that never happened."
+            exit 1
+          fi
+          echo "argus_ref '$ARGUS_REF' is enumerated."
+
+  scan-main:
+    name: "hardening (argus@main)"
+    needs: guard-ref
+    if: inputs.argus_ref == 'main'
     uses: huntridge-labs/argus/.github/workflows/reusable-security-hardening.yml@main
     with:
       scanners: ${{ inputs.scanners }}
@@ -29,3 +64,4 @@ jobs:
       # run at startup with no jobs and no annotation. Compare to coerce.
       allow_failure: ${{ inputs.allow_failure == 'true' || inputs.allow_failure == true }}
       post_pr_comment: ${{ inputs.post_pr_comment == 'true' || inputs.post_pr_comment == true }}
+

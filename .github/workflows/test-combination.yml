@@ -3,6 +3,11 @@ name: "Combination Tests"
 on:
   workflow_call:
     inputs:
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
       max_parallel:
         required: false
         type: number
@@ -40,7 +45,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel || 4 }}
+      max-parallel: ${{ inputs.max_parallel || 3 }}
       matrix:
         t:
           - { id: C1,  name: "trivy+syft pair",            expect: success, mode: remote,   image: "nginx:1.19.0",                            cname: c1-trivy-syft,      scanners: "trivy,syft",       sev: none,     allow: 'false' }
@@ -61,6 +66,7 @@ jobs:
         with:
           test_id: ${{ matrix.t.id }}
           expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
           scan_mode: ${{ matrix.t.mode }}
           image_ref: ${{ matrix.t.image }}
           container_name: ${{ matrix.t.cname }}

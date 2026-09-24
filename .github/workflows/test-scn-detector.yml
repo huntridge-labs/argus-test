@@ -1110,7 +1110,18 @@ jobs:
           [ "$HAS_CHANGES" = "true" ] || { echo "FAIL: has_changes=$HAS_CHANGES"; FAILURES=$((FAILURES + 1)); }
           [ "${MANUAL_REVIEW:-0}" -ge 1 ] || { echo "FAIL: manual_review_count=$MANUAL_REVIEW (expected >=1)"; FAILURES=$((FAILURES + 1)); }
 
-          # Dry-run JSON should NOT contain MANUAL_REVIEW issues (not merging to default branch)
+          # MANUAL_REVIEW issues are created only on a push to the default
+          # branch (create_scn_issue.py: event 'push' and ref
+          # refs/heads/$GITHUB_DEFAULT_BRANCH, which defaults to 'main'). This
+          # used to expect 0 unconditionally, so it passed on feature branches
+          # and failed on every run of main -- where 1 is the correct answer.
+          # Mirror argus's rule instead of assuming which branch we are on.
+          DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            WANT_MR=1; WHY="a push to $DEFAULT_BRANCH"
+          else
+            WANT_MR=0; WHY="not a push to $DEFAULT_BRANCH"
+          fi
           if [ -f scn-reports/dry-run-issues.json ]; then
             MR_COUNT=$(python3 -c "
           import json
@@ -1118,7 +1129,7 @@ jobs:
           mr = [i for i in d.get('issues', []) if i.get('category') == 'MANUAL_REVIEW']
           print(len(mr))
           ")
-            [ "$MR_COUNT" -eq 0 ] || { echo "FAIL: MANUAL_REVIEW issues=$MR_COUNT (expected 0 — not merging to default)"; FAILURES=$((FAILURES + 1)); }
+            [ "$MR_COUNT" -eq "$WANT_MR" ] || { echo "FAIL: MANUAL_REVIEW issues=$MR_COUNT (expected $WANT_MR -- $WHY)"; FAILURES=$((FAILURES + 1)); }
           fi
 
           [ "$FAILURES" -eq 0 ] && echo "PASS: manual review correctly detected"
@@ -1688,6 +1699,7 @@ jobs:
       - s23-custom-config
       - s24-single-file-multi-resource
       - s25-ai-fallback
+      - ai-key-check
     if: always()
     outputs:
       results: ${{ steps.collect.outputs.results }}
@@ -1719,6 +1731,7 @@ jobs:
           S23: ${{ needs.s23-custom-config.result }}
           S24: ${{ needs.s24-single-file-multi-resource.result }}
           S25: ${{ needs.s25-ai-fallback.result }}
+          AI_KEY: ${{ needs.ai-key-check.outputs.present }}
         run: |
           FAILURES=0
 
@@ -1761,7 +1774,16 @@ jobs:
           check "S22 cfn-classification" "$S22" "success"
           check "S23 custom-config" "$S23" "success"
           check "S24 single-file-multi-resource" "$S24" "success"
-          check "S25 ai-fallback" "$S25" "success"
+          # S25 is skipped by design when there is no ANTHROPIC_API_KEY (see
+          # ai-key-check), so without a key the correct outcome is `skipped`.
+          # Expecting success unconditionally turned that clean skip into a
+          # failure here -- the missing-secret-as-regression the skip exists
+          # to prevent.
+          if [ "$AI_KEY" = "true" ]; then
+            check "S25 ai-fallback" "$S25" "success"
+          else
+            check "S25 ai-fallback (no API key)" "$S25" "skipped"
+          fi
 
           echo ""
           echo "============================================"
@@ -1871,6 +1893,6 @@ jobs:
               {"id":"S22","name":"cfn classification","detail":"Does the SCN detector classify a CloudFormation S3 bucket tag change as ROUTINE?","status":$s22},
               {"id":"S23","name":"custom config","detail":"Does the SCN detector apply a custom config_file in place of the default profile?","status":$s23},
               {"id":"S24","name":"single-file multi-resource","detail":"Does the SCN detector extract both resources when one .tf file declares two?","status":$s24},
-              {"id":"S25","name":"AI fallback","detail":"Does the SCN detector fall back to AI classification instead of MANUAL_REVIEW for an unmatched resource?","status":$s25}
+              {"id":"S25","name":"AI fallback","detail":"Does the SCN detector fall back to AI classification instead of MANUAL_REVIEW for an unmatched resource?","status":$s25,"reason":"Needs ANTHROPIC_API_KEY to reach the classifier. Without it the test is skipped rather than failing, because an absent key is a configuration fact, not an argus defect."}
             ]')
           echo "results=$RESULTS" >> "$GITHUB_OUTPUT"

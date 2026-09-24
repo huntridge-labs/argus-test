@@ -13,6 +13,7 @@ Comprehensive test suite for [huntridge-labs/argus](https://github.com/huntridge
 | `security-summary` | Composite action: stitches per-container summaries, renders the pass/fail table, enforces `fail_on_scanner_failure` |
 | `setup-argus` | Composite action: installs the argus Python package the scan workflows call |
 | SCN detector | Significant Change Notification detector: AI classifier, diff helpers, report generation |
+| Runtime environment | Host-dependent SDK behaviour: daemonless runners, image architecture selection, and the `0`/`1`/`2` exit-code contract — none of which survives the dispatch path |
 
 **Not covered here.** As of argus 1.x, `container-scan.yml` invokes
 `python -m argus scan container` directly and no longer calls the
@@ -28,17 +29,26 @@ downstream repo calling `@main` still gets the behaviour it expects.
 Test results are published to GitHub Pages with each run. The page is three
 blocks, in priority order:
 
-1. **Status header** &mdash; an A&ndash;F grade, passed/defined, movement against the
-   previous run, the argus ref/version/commit under test, and a score-by-date
+1. **Status header** &mdash; a severity-weighted **risk index**, a pass rate over
+   every test the suite defines, movement against the previous run, the argus
+   ref/version/commit under test with its liveness split, and a score-by-date
    chart. Counts double as filters.
 
-   The grade is `passed ÷ every test the suite defines`, so tests that did not
-   run count as *no assurance* rather than silently vanishing &mdash; otherwise a
-   suite that skips most of itself and passes the rest would score an A. A
-   failing test then caps the grade at B, because "96% passing" is not an A when
-   the missing 4% is a severity gate that stopped enforcing.
+   The pass rate is `passed ÷ every test the suite defines`, so tests that did
+   not run count as *no assurance* rather than silently vanishing &mdash;
+   otherwise a suite that skips most of itself and passes the rest would look
+   healthy.
+
+   **There is deliberately no letter grade.** One letter is severity-blind: a
+   scan reporting success without scanning and a failed report upload each cost
+   it exactly one test, so "96% passing" would read as good over a state that
+   includes a gate that stopped enforcing. The risk index carries the severity
+   and the colour; the pass rate is a breadth figure and is rendered uncoloured
+   for that reason. Both are computed once, written into `history.json`, and
+   *read* by the branch hub and the root index &mdash; so the three levels of the
+   site cannot derive different headlines from the same run.
 2. **Search** &mdash; one box that answers whether a behaviour is tested (below).
-3. **One flat table of every entry** &mdash; all 81 tests and all 19 coverage notes,
+3. **One flat table of every entry** &mdash; all 88 tests and every coverage note,
    visible without a single click, grouped by category with a sticky header.
    Failing rows are tinted; every row links to the exact line of the workflow
    that defines it, and separately to the logs of the job that ran it.
@@ -117,21 +127,82 @@ sentence model would. Results deep-link (`?q=...`), and `/` focuses the box.
 You can test an Argus feature branch before merging to main:
 
 ```bash
-# Test a feature branch (unit + action tests use the custom ref)
-gh workflow run test-suite.yml -f argus_ref=feat/my-feature
+# Every suite, pinned to a branch
+gh workflow run test-suite.yml -f argus_ref=fix/container-scan-no-silent-pass
 
-# Test only unit tests against a branch
-gh workflow run test-suite.yml -f scope=unit -f argus_ref=feat/my-feature
-
-# Test only direct action tests against a branch
-gh workflow run test-suite.yml -f scope=actions -f argus_ref=feat/my-feature
+# One scope only
+gh workflow run test-suite.yml -f scope=runtime-env -f argus_ref=fix/container-scan-no-silent-pass
 ```
 
-**Scope of feature branch testing:**
-- **Unit tests (U1-U5):** Full support — checkout argus at the specified ref and run pytest
-- **Direct action tests (A1-A5):** Full support — checkout argus at the specified ref and use local action paths
-- **Remote/Discover/Combination tests:** Always test `@main` — GitHub Actions requires static refs for reusable workflow `uses:` directives
-- **Regression tests:** I2 uses the custom ref; I1 always tests `@main`
+The ref must be listed in [`.github/data/argus-refs.json`](.github/data/argus-refs.json).
+An unlisted ref is **refused**, not defaulted to `main`.
+
+<details>
+<summary><strong>Why a ref has to be enumerated</strong></summary>
+
+A reusable-workflow `uses:` reference cannot be an expression — GitHub resolves
+it when the workflow is parsed, before any input exists. So each dispatch target
+names every ref it can call as a literal job, selected by `if:`.
+
+An unlisted ref therefore matches *no* job. Every scan job is skipped, and **a
+run of nothing concludes `success`** — a green tick for a ref nothing was tested
+against. `argus-scan`, `argus-dispatch` and a guard job in each target all
+refuse instead, and `I4` fails at review time if the enumeration and the targets
+drift apart.
+
+</details>
+
+### What a branch run actually tests
+
+This is the part that surprises people, so the dashboard states it next to the
+ref rather than burying it here.
+
+Referencing `container-scan.yml@<branch>` gets you **that branch's workflow
+YAML**. But every `uses:` *inside* that file keeps the release pin written into
+it at release time — including `setup-argus`, which installs the SDK from its
+own checkout:
+
+```yaml
+uses: huntridge-labs/argus/.github/actions/setup-argus@1.12.5
+```
+
+```bash
+ROOT="$(cd "${{ github.action_path }}/../../.." && pwd)"; pip install "$ROOT"
+```
+
+`github.action_path` is the checkout of the ref **the action** was referenced
+at, not the ref the workflow was. So a branch run executes branch YAML against
+the **released** SDK. Run the audit to see the split for any ref:
+
+```bash
+bash .github/scripts/audit-ref-liveness.sh fix/container-scan-no-silent-pass /tmp/liveness.json
+```
+
+For `fix/container-scan-no-silent-pass` the answer is **0 of 23 nested
+references live** — every one is pinned at `1.12.5`. `reusable-security-hardening.yml`
+is worse than average: it pins `container-scan.yml@1.12.5`, so calling *it* at a
+branch does not even get the branch's container scan.
+
+| Which half | Branch-live? | Covered by |
+|---|---|---|
+| Entry-point workflow YAML — `validate-inputs`, the nine `workflow_call` outputs, `search_paths` / `platform` / `fail_on_no_targets`, the `argus_scan_incomplete` sentinel | **Yes** | R / D / C / E / W, dispatched |
+| The Python SDK — `validate_sub_scanners`, the exit-code contract, `detect_image_platforms`, `_sub_scanner_failed` | **No** | **N1–N5** (`test-runtime-env.yml`), U, A — these check argus out at the ref |
+
+That split is why `test-runtime-env.yml` exists and why its tests drive the CLI
+directly instead of dispatching: it is also the only place the raw **exit code**
+is observable. A dispatched run exposes a conclusion, which collapses exit 1
+("findings") and exit 2 ("could not scan") into the single word `failure` — and
+telling those apart is the whole point of the contract.
+
+**Per-suite support:**
+
+| Suite | Honours `argus_ref` | Notes |
+|---|---|---|
+| Unit (U1–U5) | Full | Checks argus out at the ref, runs pytest |
+| Direct action (A1–A5) | Full | Local action paths from the ref's checkout |
+| **Runtime environment (N1–N5)** | **Full** | SDK-direct; the only suite that sees exit codes |
+| Remote / Discover / Combination / Edge / Workflows | YAML only | Dispatched; SDK stays at its release pin |
+| Regression | I2 and I4 use the ref; I1 and I3 dispatch |  |
 
 ## Execution Path
 
@@ -196,7 +267,7 @@ flowchart TD
     SUM5 -->|no| SUM7["step summary only"]
 ```
 
-## Test Matrix (81 tests)
+## Test Matrix (88 tests)
 
 ### Reading the expectations
 
@@ -388,13 +459,44 @@ Validates the [argus scn-detector](https://github.com/huntridge-labs/argus) acti
 | S17 | manual-review | Terraform | MANUAL_REVIEW | Unmatched resource triggers manual review |
 | S18-S25 | additional coverage | Various | Various | Delete ops, custom profiles, multi-resource, AI fallback |
 
+### Runtime Environment Tests — `test-runtime-env.yml`
+
+Five tests that depend on **what the host has** and on **which image variant
+argus chose** — neither of which a dispatched test can reach, because a
+dispatched run installs the SDK from `setup-argus@<tag>` no matter what
+`argus_ref` says. These check argus out at the ref and drive the CLI directly,
+which is also the only place the raw exit code is visible.
+
+| ID | Asserts | Currently |
+|----|---------|-----------|
+| **N1** | A default scan exits `0` on a runner with trivy and grype but **no container runtime**, and names the sub-scanners that could not run | expected red — reviewer blocker 1 |
+| **N2** | `--scanners exposure` on that same host exits **non-zero** | expected green |
+| **N3** | An unpullable image exits **`2`**, not `0` and not `1` | expected red until released |
+| **N4** | A failed pull retries against a platform the **manifest publishes**, never a hardcoded `linux/amd64` | expected red — reviewer blocker 4 |
+| **N5** | A locally-built, never-pushed image scans under an explicit `--platform`, and **names the architecture** the findings actually describe | expected red — reviewer blocker 3 |
+
+N1 and N2 are asserted in **one job**, deliberately. They are the two halves of
+the same split — "not asked for and cannot run here" versus "explicitly
+requested and cannot run" — and getting either wrong is a real failure:
+collapsing them towards failure reds every scan on a rootless runner until
+someone switches the gate off; collapsing them the other way restores the silent
+pass. Splitting them across two jobs would let them drift.
+
+The runtime is removed by **narrowing `PATH`** to a directory holding only trivy
+and grype, then asserting `docker`, `podman` and `nerdctl` are all absent before
+argus is invoked. argus finds runtimes with `shutil.which`, so this is exactly
+what a hardened runner looks like to it — an induced condition, not a mock.
+
 ### Regression Tests — `test-suite.yml`
 
 | # | Test | Validates |
 |---|------|-----------|
-| I1 | infrastructure-scan | trivy-iac + checkov still work |
+| I1 | happy path | The ordinary documented use -- clean image, default scanners, a realistic gate -- scans at least one image and succeeds |
 | I2 | no-hardcoded-urls | No github.com URLs in action shell scripts |
 | I3 | config-driven-scan | container-scan-from-config.yml reusable workflow still works |
+| I4 | dispatch targets cover every ref | Every ref in `argus-refs.json` has a job in all four dispatch targets |
+| I5 | infrastructure-scan | trivy-iac + checkov still work |
+| I6 | no duplicate test tuples | No two matrix rows are the same test (see [Duplicate tests](#duplicate-tests-i6)) |
 
 ## Quick Start
 
@@ -421,6 +523,57 @@ gh workflow run test-suite.yml -f argus_ref=feat/my-feature
 # Monitor
 gh run watch
 ```
+
+### Which branches are assessed
+
+`main`, `dev`, and any `feat/**` or `fix/**` branch. Deliberately not `**`: a
+run is ~95 jobs plus child argus runs, so a scratch branch pushed twice a
+minute would swamp the runner pool and the dispatch targets.
+
+Publishing also needs the **`github-pages` environment** to allow the branch.
+That is repo configuration, not workflow code, so it has to be kept in step
+with the trigger list — the policy currently allows `main`, `dev`, `feat/*`
+and `fix/*`. A branch the policy rejects fails at the environment gate with no
+steps run, which is at least loud.
+
+A branch publishes at its **slug**: `feat/foo` renders at `/feat-foo/` and
+displays as `feat/foo`. Artifact names reject `/`, and a nested directory would
+make every relative link on the page depth-dependent.
+
+> **One suite run per branch at a time.** Dispatched argus runs share a single
+> pool, and `reap-orphans` used to cancel every child not carrying its own run
+> id — so two branches running concurrently cancelled each other's children and
+> published partial boards. Markers now carry the branch slug and reaping is
+> scoped to it.
+
+### Site layout
+
+Each branch publishes its own subtree, so `dev` results never overwrite
+`main`'s and the two histories stay independent:
+
+```
+argus-test/
+├── index.html                       the index: every branch and its figures
+├── branches.json                    manifest; a publishing branch reads it to
+│                                    know which other branches to carry along
+├── main/
+│   ├── index.html                   redirect -> tests/
+│   ├── history.json                 last 20 runs, for the score chart
+│   ├── favicon.png
+│   └── tests/index.html             the board: every test, searchable
+└── feat-some-branch/
+    └── …                            same shape, published at its slug
+```
+
+There is **no per-branch hub**. It restated the figures already on the index
+card and cost a click to reach the page the reader wanted, so `/<branch>/`
+redirects to the board. Kept as a redirect rather than removed so trimming a
+URL back a level, or an old bookmark, still lands somewhere useful.
+
+The board carries a breadcrumb back to the index and a switcher to the same
+view on another branch. Figures on the index are read from each branch's
+published `history.json` rather than recomputed, so it cannot disagree with the
+page it links to.
 
 ## Repository Structure
 
@@ -514,8 +667,48 @@ deduplication means.
 
 | Item | Status |
 |------|--------|
-| Discover-mode severity gate in isolation | Not testable while `broken/Dockerfile` exists and `container-scan.yml` exposes no `search_paths` |
-| Counts, per-scanner status, dedup totals | Not observable — `container-scan.yml` declares no `workflow_call` outputs; E12 works around it via artifacts |
-| Unscannable image exit code (R9) | Deliberately loose — argus states no contract for "nothing could be scanned", so R9 accepts both outcomes |
-| `scanners: bogusscanner` (E5) | POLICY assertion — unknown scanner names are dropped silently by `argus/scanners/container.py` |
-| `image_ref: ""` in remote mode (E9) | POLICY assertion — both scan jobs skip and only the summary runs |
+| Discover-mode severity gate in isolation | Still open (GAP-1). `search_paths` now exists on refs carrying PR #427, so this is unblocked but unwritten |
+| Counts, per-scanner status, dedup totals | **Closed.** `container-scan.yml` declares nine `workflow_call` outputs; `argus-run.yml` republishes them as a `scan-outputs` artifact and `argus-scan` gained `assert_outputs`. First user is D5 |
+| Unscannable image exit code | **Closed.** The contract is `0` ran-and-clean / `1` findings / `2` could-not-scan. N3 asserts `2` specifically — not merely non-zero, because 1 and 2 are both non-zero and mean opposite things |
+| `scanners: bogusscanner` (E5) | **Fixed upstream.** `validate-inputs` refuses it before any scan job starts. E5 is an ordinary CONTRACT assertion now |
+| `image_ref: ""` in remote mode (E9) | **Fixed upstream.** Same job, same run. E9 is an ordinary CONTRACT assertion now |
+| `trivy,bogusscanner` (E6) | **Expectation flipped** to `failure`. A partly-valid list is refused whole. The reasoning is restated in `test-edge.yml`'s header — the alternative belongs upstream as an argus issue, not as a silent flip back |
+
+### Expected red, and why that is the point
+
+`N1`, `N3`, `N4`, `N5` and `D5` encode the resolution of blockers raised on
+argus PR #427 that are **not yet fixed** on the branch. They are expected red
+against `fix/container-scan-no-silent-pass` at `4e2b481a`.
+
+The reviewer's closing line on that PR was *"All 66 checks pass, so none of the
+four above is caught today."* Catching them is what these tests are for. If one
+goes green without the corresponding upstream change, the test is wrong — not
+argus.
+
+## Duplicate tests (I6)
+
+A matrix row that is identical to another once its `id` and display name are
+removed is one test counted twice: it adds nothing, and it inflates the
+denominator of the board's pass rate. PR #13 removed six of these by hand. I6
+fails the build on any it finds (`.github/scripts/check-duplicate-tuples.py`),
+and fails closed: if it reads no matrix rows at all, that is a failure, not a
+pass.
+
+It checks two tiers — **exact** (every parameter
+matches) and **invocation** (the same argus call, differing only by container
+name). A row that duplicates another on purpose is annotated in place:
+
+```yaml
+# dry:allow R12 dispatches the same scan as R7 on purpose: the test is R12a,
+# which downloads the report from R12's child run and asserts dedup.
+- { id: R12, ... }
+```
+
+Two such pairs exist today (`E7`/`E11`, `R7`/`R12`) and both are annotated, so
+I6 passes with zero unexplained duplicates rather than being tuned to ignore
+them.
+
+This replaced a code-cleanliness page (duplication percentage, cognitive
+complexity, and this check as a report-only figure). The rest measured style,
+gated nothing, and sat outside what this suite is for; duplicate tests are the
+part that affects the suite's own numbers, so that part became a gate.

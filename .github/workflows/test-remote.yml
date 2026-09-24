@@ -3,6 +3,11 @@ name: "Remote Mode Tests"
 on:
   workflow_call:
     inputs:
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
       max_parallel:
         description: "How many tests may run at once"
         required: false
@@ -61,7 +66,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel || 4 }}
+      max-parallel: ${{ inputs.max_parallel || 3 }}
       matrix:
         t:
           - { id: R1,  name: "vuln + all scanners",          expect: success, image: "nginx:1.19.0",                              cname: r1-nginx-vuln,        scanners: "trivy,grype,syft", sev: none,     allow: 'false' }
@@ -74,6 +79,12 @@ jobs:
           - { id: R9,  name: "bad image does not crash",     expect: any,     image: "nonexistent/nosuchimage:v0",                 cname: r9-bad-image,         scanners: "trivy",            sev: none,     allow: 'false' }
           - { id: R10, name: "clean + strict threshold",     expect: success, image: "gcr.io/distroless/static-debian12:latest",   cname: r10-distroless-strict, scanners: "trivy,grype",     sev: low,      allow: 'false' }
           - { id: R11, name: "SBOM-only never gates",        expect: success, image: "alpine:3.18",                               cname: r11-syft-no-gate,     scanners: "syft",             sev: low,      allow: 'false' }
+          # dry:allow R12 dispatches the same scan as R7 on purpose: the test is
+          # R12a, which downloads the report from R12's child run and asserts
+          # trivy and grype findings were deduplicated. PR #13 flagged R12 as
+          # byte-identical to R7 and gave it that follow-on job rather than
+          # deleting it. The invocation is still duplicated, and a future tidy
+          # could point R12a at R7's artifact and drop this row.
           - { id: R12, name: "dedup validation",             expect: success, image: "nginx:1.19.0",                              cname: r12-nginx-dedup,      scanners: "trivy,grype",      sev: none,     allow: 'false' }
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +94,7 @@ jobs:
         with:
           test_id: ${{ matrix.t.id }}
           expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
           scan_mode: remote
           image_ref: ${{ matrix.t.image }}
           container_name: ${{ matrix.t.cname }}

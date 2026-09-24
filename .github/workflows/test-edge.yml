@@ -3,6 +3,11 @@ name: "Edge & Adversarial Tests"
 on:
   workflow_call:
     inputs:
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
       max_parallel:
         required: false
         type: number
@@ -22,10 +27,39 @@ permissions:
 # ============================================================================
 # Edge and adversarial coverage: matrix over a parameter table.
 #
-# E5, E8 and E9 assert argus FAILS, so they are green when it does. E5 and E9
-# are the open findings -- argus reports success having scanned nothing -- so
-# they are expected RED, and that red is real rather than an artifact of how
-# the test is wired.
+# E5, E6, E8 and E9 assert argus FAILS, so they are green when it does.
+#
+# E5 AND E9 WERE THE OPEN FINDINGS, AND ARE NOW FIXED UPSTREAM.
+# Both encoded argus reporting success having scanned nothing: an unrecognised
+# scanner name that matched no dispatch branch, and scan_mode=remote with an
+# empty image_ref that gated every scan job off. argus PR #427 adds a
+# `validate-inputs` job to container-scan.yml that refuses both before any scan
+# job starts. That job is pure bash in the workflow file itself, so it IS live
+# on a branch run -- unlike the Python half of the same PR, which stays pinned
+# at the released SDK (see audit-ref-liveness.sh). The expected-RED annotation
+# that used to live here has been removed along with the matching note in
+# failure-classes.json; if these go red again it is a regression, not a known
+# state.
+#
+# E6 PINS A CHOICE, AND THE CHOICE CHANGED. It passes `trivy,bogusscanner`:
+# one name argus knows, one it does not. It used to assert `success`, which
+# encoded "a typo is tolerated as long as something valid is left". PR #427's
+# validate_sub_scanners rejects the whole list if any member is unknown, so
+# this now asserts `failure`.
+#
+# The reasoning for accepting that, rather than arguing the list should run its
+# valid members: `scanners: trivy,tryvi` most likely means the author wanted
+# two scanners. Running one of them and reporting green attests to coverage
+# nobody verified, and the annotation that would carry the warning is exactly
+# the ::notice:: the same PR found people never read. Refusing costs one red
+# build and one obvious edit; tolerating costs a gate that silently covers half
+# of what its author believed. Fail-closed on a name the tool cannot honour is
+# the same rule E5 and E9 now enforce, and a suite that argued the opposite in
+# the neighbouring row would be incoherent.
+#
+# The alternative -- partial lists run their valid names and annotate loudly --
+# is defensible and belongs upstream as an argus issue, not as a silent flip
+# back here. Whoever reopens it should move this comment with the decision.
 #
 # Two entries carry deliberately hostile values and must stay exactly as
 # written: E3's scanner list has padding, mixed case and a repeat; E7's
@@ -75,14 +109,18 @@ jobs:
     needs: e1-resolve-digest
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_parallel || 4 }}
+      max-parallel: ${{ inputs.max_parallel || 3 }}
       matrix:
         t:
           - { id: E1,  name: "digest-pinned image",        expect: success, image: "nginx@${{ needs.e1-resolve-digest.outputs.digest }}", cname: "e1-digest-pinned",    scanners: "trivy",              sev: none, user: "" }
           - { id: E2,  name: "fully-qualified host",       expect: success, image: "docker.io/library/alpine:3.18",             cname: "e2-fq-alpine",        scanners: "trivy,grype",        sev: none, user: "" }
           - { id: E3,  name: "messy scanners normalise",   expect: success, image: "gcr.io/distroless/static-debian12:latest",  cname: "e3-normalisation",    scanners: "trivy , TRIVY ,grype,  Trivy", sev: none, user: "" }
           - { id: E5,  name: "no valid scanner (policy)",  expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e5-no-valid-scanner", scanners: "bogusscanner",       sev: none, user: "" }
-          - { id: E6,  name: "valid + typo'd scanner",     expect: success, image: "gcr.io/distroless/static-debian12:latest",  cname: "e6-partial-typo",     scanners: "trivy,bogusscanner", sev: none, user: "" }
+          - { id: E6,  name: "valid + typo'd scanner",     expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e6-partial-typo",     scanners: "trivy,bogusscanner", sev: none, user: "" }
+          # dry:allow E7's container_name IS the test -- a slash and a space in a
+          # value argus uses to build file and artifact names. The invocation
+          # matches E11's once cname is treated as cosmetic, which for every
+          # other row it is.
           - { id: E7,  name: "container_name sanitisation", expect: success, image: "gcr.io/distroless/static-debian12:latest", cname: "Edge/Case Name",      scanners: "trivy",              sev: none, user: "" }
           - { id: E8,  name: "auth without password",      expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e8-auth-no-password", scanners: "trivy",              sev: none, user: "notarealuser" }
           - { id: E9,  name: "empty image_ref (policy)",   expect: failure, image: "",                                         cname: "e9-empty-image-ref",  scanners: "trivy",              sev: none, user: "" }
@@ -97,6 +135,7 @@ jobs:
         with:
           test_id: ${{ matrix.t.id }}
           expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
           scan_mode: remote
           image_ref: ${{ matrix.t.image }}
           container_name: ${{ matrix.t.cname }}
@@ -200,7 +239,7 @@ jobs:
             "E2":  ["fully-qualified host","Does argus scan an image whose reference names the registry host explicitly?"],
             "E3":  ["messy scanners list normalises","Does argus normalise a scanner list carrying padding, mixed case and a repeat?"],
             "E5":  ["no valid scanner","Does argus fail when the scanners input names nothing it recognises?"],
-            "E6":  ["valid + typo'd scanner","Does argus still scan when one scanner name is valid and the other is a typo?"],
+            "E6":  ["valid + typo'd scanner","Does argus refuse a scanner list when one name is valid and the other is a typo, rather than silently running only the valid one?"],
             "E7":  ["container_name sanitisation","Does argus accept a container_name containing a slash and a space?"],
             "E8":  ["auth without password","Does argus fail when a registry username is supplied with no password?"],
             "E9":  ["empty image_ref","Does argus fail when scan_mode is remote and image_ref is empty?"],

@@ -1,50 +1,67 @@
-[
-  {
-    "id": "GAP-1",
-    "kind": "gap",
-    "name": "discover-mode severity gate in isolation",
-    "question": "Does argus fail a discover run on the severity gate alone, with no broken build involved?",
-    "issue": 6,
-    "why": "Blocked on argus."
-  },
-  {
-    "id": "GAP-2",
-    "kind": "gap",
-    "name": "finding counts and per-scanner status from a caller",
-    "question": "Can a caller of container-scan.yml read finding counts or per-scanner status from the workflow itself?",
-    "issue": 7,
-    "why": "Narrowed, not closed."
-  },
-  {
-    "id": "GAP-3",
-    "kind": "gap",
-    "name": "exit code for an unscannable image",
-    "question": "Does argus exit non-zero when an image cannot be pulled and nothing could be scanned?",
-    "issue": 8,
-    "why": "Blocked on a decision in argus."
-  },
-  {
-    "id": "GAP-4",
-    "kind": "gap",
-    "name": "private registry authentication success path",
-    "question": "Does argus successfully pull and scan an image from a private registry using real credentials?",
-    "issue": 9,
-    "why": "Blocked on credentials."
-  },
-  {
-    "id": "GAP-5",
-    "kind": "gap",
-    "name": "GHES runtime behaviour",
-    "question": "Does argus actually run correctly on GitHub Enterprise Server?",
-    "issue": 10,
-    "why": "Blocked on infrastructure."
-  },
-  {
-    "id": "GAP-8",
-    "kind": "gap",
-    "name": "pull request comment rendering from a consumer",
-    "question": "Does a consumer of container-scan.yml get a correctly formatted pull request comment?",
-    "issue": 11,
-    "why": "Blocked on a trigger."
-  }
-]
+{
+  "_comment": [
+    "Behaviours this suite does NOT test, and why. The dashboard search reads",
+    "this so that 'is X tested?' can answer 'no, and here is the reason' rather",
+    "than returning nothing -- silence is indistinguishable from a pass.",
+    "",
+    "A gap is retired by writing the test, not by deleting the entry. _retired",
+    "records which test replaced each one, so a gap cannot quietly disappear;",
+    "that is the failure mode this list exists to prevent."
+  ],
+  "_retired": [
+    {
+      "id": "GAP-2",
+      "name": "finding counts and per-scanner status from a caller",
+      "question": "Can a caller of container-scan.yml read finding counts or per-scanner status from the workflow itself?",
+      "was": "Narrowed, not closed.",
+      "replaced_by": [
+        "D5"
+      ],
+      "note": "argus PR #427 adds nine workflow_call outputs to container-scan.yml, of which overall_status ('success' / 'failure' / 'skipped') and images_scanned (incomplete legs excluded) are the two that answer this. argus-run.yml now republishes them as a scan-outputs artifact and argus-scan gained assert_outputs, so a test can assert on them instead of on the run's conclusion. D5 is the first user: it asserts a mixed run reports a non-success overall_status and counts only the leg that actually ran."
+    },
+    {
+      "id": "GAP-3",
+      "name": "exit code for an unscannable image",
+      "question": "Does argus exit non-zero when an image cannot be pulled and nothing could be scanned?",
+      "was": "Blocked on a decision in argus.",
+      "replaced_by": [
+        "N3"
+      ],
+      "note": "The decision is made: argus PR #427 defines 0 = ran and clean, 1 = findings at or above the threshold, 2 = the scan could not be completed. N3 asserts 2 specifically rather than merely non-zero, because 1 and 2 are both non-zero and mean opposite things to a caller. It lives in test-runtime-env.yml, which drives the CLI directly -- a dispatched run only exposes a conclusion, which collapses 1 and 2 into 'failure'."
+    }
+  ],
+  "gaps": [
+    {
+      "id": "GAP-1",
+      "kind": "gap",
+      "name": "discover-mode severity gate in isolation",
+      "question": "Does argus fail a discover run on the severity gate alone, with no broken build involved?",
+      "issue": 6,
+      "why": "Blocked on argus."
+    },
+    {
+      "id": "GAP-4",
+      "kind": "gap",
+      "name": "private registry authentication success path",
+      "question": "Does argus successfully pull and scan an image from a private registry using real credentials?",
+      "issue": 9,
+      "why": "Blocked on credentials."
+    },
+    {
+      "id": "GAP-5",
+      "kind": "gap",
+      "name": "GHES runtime behaviour",
+      "question": "Does argus actually run correctly on GitHub Enterprise Server?",
+      "issue": 10,
+      "why": "Blocked on infrastructure."
+    },
+    {
+      "id": "GAP-8",
+      "kind": "gap",
+      "name": "pull request comment rendering from a consumer",
+      "question": "Does a consumer of container-scan.yml get a correctly formatted pull request comment?",
+      "issue": 11,
+      "why": "Blocked on a trigger."
+    }
+  ]
+}

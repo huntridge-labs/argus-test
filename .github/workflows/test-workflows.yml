@@ -2,6 +2,12 @@ name: "Top-level Workflow Tests"
 
 on:
   workflow_call:
+    inputs:
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
     outputs:
       results:
         description: "JSON array of individual test results"
@@ -42,17 +48,29 @@ jobs:
       max-parallel: 2
       matrix:
         t:
-          - { id: W1, name: "hardening, trivy-iac only",     scanners: "trivy-iac",         iac_path: "tests/iac" }
-          - { id: W2, name: "hardening, lint only",          scanners: "lint",              iac_path: "" }
-          - { id: W3, name: "hardening, gitleaks + trivy-iac", scanners: "gitleaks,trivy-iac", iac_path: "tests/iac" }
-          - { id: W4, name: "hardening, unknown scanner",    scanners: "bogusscanner",      iac_path: "" }
+          - { id: W1, name: "hardening, trivy-iac only",     expect: success, scanners: "trivy-iac",         iac_path: "tests/iac" }
+          - { id: W2, name: "hardening, lint only",          expect: success, scanners: "lint",              iac_path: "" }
+          - { id: W3, name: "hardening, gitleaks + trivy-iac", expect: success, scanners: "gitleaks,trivy-iac", iac_path: "tests/iac" }
+          # W4 asserted `success` because an unrecognised token used to fall
+          # back to DEFAULT_SCANNERS: `scanners: bogusscanner` quietly ran
+          # gitleaks, checkov, opengrep, bandit, sbom, trivy-iac and the
+          # container scanner, then reported green over a request nobody made.
+          # The test was pinning that behaviour in place. argus PR #427 collects
+          # unknown tokens in validate-inputs and exits 1 before any job starts,
+          # so this now asserts failure.
+          #
+          # allow_failure cannot absorb it, and should not: allow_failure
+          # governs whether FINDINGS decide the outcome, not whether the
+          # workflow will run a scan the caller did not ask for.
+          - { id: W4, name: "hardening, unknown scanner",    expect: failure, scanners: "bogusscanner",      iac_path: "" }
     steps:
       - uses: actions/checkout@v4
       - id: t
         uses: ./.github/actions/argus-dispatch
         with:
           test_id: ${{ matrix.t.id }}
-          expect: success
+          expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
           workflow: argus-hardening-run.yml
           inputs_json: >-
             {"scanners":"${{ matrix.t.scanners }}","iac_path":"${{ matrix.t.iac_path }}","allow_failure":true,"post_pr_comment":false}
@@ -94,7 +112,7 @@ jobs:
             "W1": ["hardening trivy-iac","Does the reusable-security-hardening workflow run when a caller selects only the trivy-iac scanner?"],
             "W2": ["hardening lint","Does the reusable-security-hardening workflow run when a caller selects only the lint scanners?"],
             "W3": ["hardening multi-scanner","Does the reusable-security-hardening workflow fan out and stitch a summary when a caller selects gitleaks and trivy-iac together?"],
-            "W4": ["hardening unknown scanner","Does the reusable-security-hardening workflow finish cleanly when the scanners input names nothing it recognises? (It does, by falling back to a broad default set rather than warning.)"]
+            "W4": ["hardening unknown scanner","Does the reusable-security-hardening workflow refuse an unrecognised scanner name, rather than falling back to a broad default set and reporting green over a scan nobody asked for?"]
           }
           JSON
           RESULTS=$(jq -s -c --slurpfile d /tmp/detail.json '
