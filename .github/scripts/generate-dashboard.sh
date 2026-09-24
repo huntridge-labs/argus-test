@@ -619,8 +619,11 @@ details.working[open] > summary { margin-bottom: 8px; }
 .stat-name .info { color: var(--fg3); text-decoration: none; border: none; font-size: 0.95em;
   margin-left: 3px; text-transform: none; }
 .stat-name .info:hover { color: var(--fg); }
-.statline .sum { display: block; margin-top: 3px; color: var(--fg3); font-weight: 400; }
-.statline .sum b { color: var(--fg2); font-weight: 600; }
+.statline { font-weight: 400; color: var(--fg3); line-height: 1.6; }
+.statline b { color: var(--fg); font-weight: 600; }
+.statline .tn { color: var(--fg2); }
+.statline .tw { color: var(--fg3); }
+.statline .term { white-space: nowrap; }
 .formula { font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; font-size: 0.8rem;
   color: var(--fg); margin: 2px 0 14px; }
 .formula .mhint { font-family: inherit; color: var(--fg3); font-size: 0.7rem; margin-left: 8px; }
@@ -1097,18 +1100,31 @@ __NAV_JS__
   // risk index is calculated".
   var riskCosts = [];
   ORDER.forEach(function (c) {
-    (byClass[c] || []).forEach(function (x) { riskCosts.push({ id: x.id, w: W[c] || 0 }); });
+    (byClass[c] || []).forEach(function (x) { riskCosts.push({ id: x.id, name: x.name, w: W[c] || 0 }); });
   });
-  var riskSum = '';
+  // The strip says WHAT failed, not what the worst class means: the class is
+  // on the chips (definition in the tooltip), and a sentence restating it --
+  // "argus reports success without running the check it was asked for" --
+  // told the reader nothing about this run. Each term names the test, so an
+  // id is not the only clue.
+  var riskSum;
   if (risk > 0) {
     var riskTerms = riskCosts.length <= 6
-      ? riskCosts.map(function (f) { return testLink(f.id) + ' (' + f.w + ')'; })
+      ? riskCosts.map(function (f) {
+          // One unbreakable term per test, so a wrap falls between terms and
+          // never strands a weight on its own line.
+          return '<span class="term">' + testLink(f.id) +
+                 (f.name ? ' <span class="tn">' + esc(f.name) + '</span>' : '') +
+                 ' <span class="tw">(' + f.w + ')</span></span>';
+        })
       : ORDER.filter(function (c) { return (byClass[c] || []).length; }).map(function (c) {
           return (byClass[c] || []).length + ' ' + esc(SHORT[c] || LBL[c] || c) + ' \u00d7 ' + (W[c] || 0);
         });
-    riskSum = '<span class="sum">risk <b>' + risk + '</b> = ' + riskTerms.join(' + ') + '</span>';
+    riskSum = 'risk <b>' + risk + '</b> = ' + riskTerms.join(' + ');
+  } else {
+    riskSum = 'risk <b>0</b>: no failures';
   }
-  $('rate').innerHTML = '<div class="statline">' + st.line + riskSum + '</div>';
+  $('rate').innerHTML = '<div class="statline">' + riskSum + '</div>';
 
   // Bracketed markers link to their footnote, and each footnote links back to
   // the marker that cited it. A citation you cannot follow is decoration.
