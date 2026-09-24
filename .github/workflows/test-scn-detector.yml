@@ -48,19 +48,36 @@ jobs:
     timeout-minutes: 2
     outputs:
       present: ${{ steps.check.outputs.present }}
+      why: ${{ steps.check.outputs.why }}
     steps:
-      - name: Check for an AI key
+      # Present is not enough: upstream's secret was set but INVALID (401), so
+      # S25 ran, the classifier call failed, and a configuration fact read as a
+      # detector regression. One cheap authenticated call says whether the key
+      # works; only a definite rejection (401/403) skips. A network error or an
+      # unexpected status lets S25 run and speak for itself.
+      - name: Check for a working AI key
         id: check
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-            echo "AI key present - S25 will run"
-          else
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "why=No ANTHROPIC_API_KEY is configured, so S25 is skipped: an absent key is a configuration fact, not an argus defect." >> "$GITHUB_OUTPUT"
             echo "::notice::No ANTHROPIC_API_KEY - S25 (AI fallback) will be skipped"
+            exit 0
           fi
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+                   -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+                   https://api.anthropic.com/v1/models || echo 000)
+          case "$CODE" in
+            401|403)
+              echo "present=false" >> "$GITHUB_OUTPUT"
+              echo "why=ANTHROPIC_API_KEY is set but the API rejects it (HTTP $CODE), so S25 is skipped. Replace the repository secret; this is configuration, not an argus defect." >> "$GITHUB_OUTPUT"
+              echo "::warning title=ANTHROPIC_API_KEY rejected::The API returned HTTP $CODE for this repository's key. S25 is skipped until the secret is replaced." ;;
+            *)
+              echo "present=true" >> "$GITHUB_OUTPUT"
+              echo "AI key accepted (HTTP $CODE) - S25 will run" ;;
+          esac
 
   # --------------------------------------------------------------------------
   # S1: Routine — tag changes (single commit)
@@ -1731,6 +1748,7 @@ jobs:
           S23: ${{ needs.s23-custom-config.result }}
           S24: ${{ needs.s24-single-file-multi-resource.result }}
           S25: ${{ needs.s25-ai-fallback.result }}
+          S25_WHY: ${{ needs.ai-key-check.outputs.why }}
           AI_KEY: ${{ needs.ai-key-check.outputs.present }}
         run: |
           FAILURES=0
@@ -1826,6 +1844,7 @@ jobs:
           S23: ${{ needs.s23-custom-config.result }}
           S24: ${{ needs.s24-single-file-multi-resource.result }}
           S25: ${{ needs.s25-ai-fallback.result }}
+          S25_WHY: ${{ needs.ai-key-check.outputs.why }}
         run: |
           to_status() {
             local got="$1" expected="$2"
@@ -1868,6 +1887,7 @@ jobs:
             --arg s23 "$(to_status "$S23" success)" \
             --arg s24 "$(to_status "$S24" success)" \
             --arg s25 "$(to_status "$S25" success)" \
+            --arg s25why "${S25_WHY:-Needs a working ANTHROPIC_API_KEY to reach the classifier. Without one the test is skipped rather than failing, because a missing or rejected key is a configuration fact, not an argus defect.}" \
             '[
               {"id":"S1","name":"routine tags","detail":"Does the SCN detector classify a Terraform tags change as ROUTINE?","status":$s1},
               {"id":"S2","name":"routine description","detail":"Does the SCN detector classify a Terraform description change as ROUTINE?","status":$s2},
@@ -1893,6 +1913,6 @@ jobs:
               {"id":"S22","name":"cfn classification","detail":"Does the SCN detector classify a CloudFormation S3 bucket tag change as ROUTINE?","status":$s22},
               {"id":"S23","name":"custom config","detail":"Does the SCN detector apply a custom config_file in place of the default profile?","status":$s23},
               {"id":"S24","name":"single-file multi-resource","detail":"Does the SCN detector extract both resources when one .tf file declares two?","status":$s24},
-              {"id":"S25","name":"AI fallback","detail":"Does the SCN detector fall back to AI classification instead of MANUAL_REVIEW for an unmatched resource?","status":$s25,"reason":"Needs ANTHROPIC_API_KEY to reach the classifier. Without it the test is skipped rather than failing, because an absent key is a configuration fact, not an argus defect."}
+              {"id":"S25","name":"AI fallback","detail":"Does the SCN detector fall back to AI classification instead of MANUAL_REVIEW for an unmatched resource?","status":$s25,"reason":$s25why}
             ]')
           echo "results=$RESULTS" >> "$GITHUB_OUTPUT"
