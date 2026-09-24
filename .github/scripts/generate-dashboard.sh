@@ -59,7 +59,7 @@ FAILED=$(echo "$ALL_JSON" | jq '[.[] | select(.status == "FAIL")] | length')
 SKIPPED=$(echo "$ALL_JSON" | jq '[.[] | select(.status == "skip" or .status == "cancel")] | length')
 RUNNABLE=$((TOTAL - SKIPPED))
 [ "$RUNNABLE" -eq 0 ] && RUNNABLE=1
-PASS_RATE=$((PASSED * 100 / RUNNABLE))
+PASS_RATE=$((PASSED * 100 / RUNNABLE))   # superseded below by PCT_DEFINED; see there
 
 if [ "$FAILED" -eq 0 ] && [ "$PASSED" -gt 0 ]; then
   VERDICT="PASS"
@@ -275,7 +275,13 @@ echo "Test catalog entries: $(echo "$CATALOG_JSON" | jq 'length')"
 # and disagreeing in public.
 DEFINED=$(echo "$CATALOG_JSON" | jq 'length')
 [ "$DEFINED" -gt 0 ] 2>/dev/null || DEFINED="$TOTAL"
+# THE pass rate: passed / defined, rounded down, everywhere. There were three
+# -- passed/defined on the headline, passed/(total - skipped) on the trend
+# line, passed/(passed + failed) for "vs last run" -- and they disagreed
+# whenever a test did not run. A test that did not run was not verified, so it
+# counts against; rounding down means the figure never overstates.
 PCT_DEFINED=$(( DEFINED > 0 ? PASSED * 100 / DEFINED : 0 ))
+PASS_RATE=$PCT_DEFINED
 WORST=$(jq -n -r --argjson all "$ALL_JSON" --argjson fc "${CLASSES_JSON:-null}" '
   ($fc // {}) as $f
   | (($f.weights) // {open:10, closed:3, auxiliary:1}) as $w
@@ -999,8 +1005,11 @@ __NAV_JS__
 
 
   // ------------------------------------------------------------------ hero
-  const ranCount = nPass + nFail;
-  const rate = ranCount ? Math.round((nPass / ranCount) * 100) : 0;
+  // The one pass rate: passed / defined, rounded down -- the same figure the
+  // generator stores as pct_defined and the index shows. histPct reads it from
+  // a history entry; entries written before it existed fall back to `rate`.
+  function histPct(p) { return p.pct_defined != null ? p.pct_defined : p.rate; }
+  const rate = tests.length ? Math.floor((nPass / tests.length) * 100) : 0;
 
   // ---- verdict + risk ------------------------------------------------------
   // Binary verdict, because a contract suite is a conformance oracle: an
@@ -1060,7 +1069,7 @@ __NAV_JS__
   // needs no arithmetic and makes no claim that the classes are commensurable,
   // which a weighted sum silently does. One fail-open is disqualifying for a
   // security gate however many other tests pass.
-  const pctPass = tests.length ? Math.round((nPass / tests.length) * 100) : 0;
+  const pctPass = rate;
   const worst = ORDER.filter(function (c) { return (byClass[c] || []).length; })[0] || 'none';
   const st = Object.assign({}, STATUS[worst] || STATUS.none);
   // No verdict badge: a non-zero risk already says the run failed, and the
@@ -1155,7 +1164,7 @@ __NAV_JS__
 
   const hist = d.history || [];
   if (hist.length >= 2) {
-    const prev = hist[hist.length - 2].rate;
+    const prev = histPct(hist[hist.length - 2]);
     const diff = rate - prev;
     const el = $('delta');
     el.className = 'delta ' + (diff > 0 ? 'up' : diff < 0 ? 'down' : '');
@@ -1295,7 +1304,7 @@ __NAV_JS__
       r.addEventListener('mouseenter', function (e) {
         const p = data[+r.dataset.i];
         tip.innerHTML = '<b>' + esc(p.date) + '</b><br>' + p.verdict + ' &middot; ' +
-          p.passed + '/' + p.total + ' (' + p.rate + '%)' +
+          p.passed + '/' + (p.defined != null ? p.defined : p.total) + ' (' + histPct(p) + '%)' +
           (typeof p.risk === 'number' ? '<br>risk ' + p.risk : '');
         tip.style.display = 'block';
         tip.style.left = (e.clientX + window.scrollX + 12) + 'px';
@@ -1324,10 +1333,10 @@ __NAV_JS__
     // and 90s, starting at 0 leaves most of the panel empty. The floor is
     // rounded down to a step and LABELLED, so the truncation is visible rather
     // than quietly exaggerating the slope.
-    const rates = hist.map(function (p) { return p.rate; });
+    const rates = hist.map(histPct);
     const lo = rates.length ? Math.min.apply(null, rates) : 0;
     const rFloor = Math.max(0, Math.min(90, Math.floor((lo - 2) / 10) * 10));
-    drawSeries('rate-trend', hist, function (p) { return p.rate; },
+    drawSeries('rate-trend', hist, histPct,
                { min: rFloor, max: 100,
                  ticks: [rFloor, Math.round((rFloor + 100) / 2), 100], muted: true });
   }
