@@ -623,7 +623,19 @@ details.working[open] > summary { margin-bottom: 8px; }
 .trend-svg { width: 100%; display: block; overflow: visible; }
 #risk-trend, #rate-trend { height: 108px; }
 .trend-head.second { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--rule); }
-.method { padding: 18px 22px; margin-bottom: 26px; }
+.method { padding: 0; margin: 26px 0 14px; }
+.method > summary { cursor: pointer; padding: 14px 22px; font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: var(--track); color: var(--fg3); list-style: none; }
+.method > summary::-webkit-details-marker { display: none; }
+.method > summary::before { content: '\25b8'; display: inline-block; width: 1.1em; }
+.method[open] > summary::before { content: '\25be'; }
+.method > summary:hover { color: var(--fg); }
+.method > #grade-note { padding: 4px 22px 18px; }
+.stat-name .info { color: var(--fg3); text-decoration: none; border: none; font-size: 0.95em;
+  margin-left: 3px; text-transform: none; }
+.stat-name .info:hover { color: var(--fg); }
+.statline .sum { color: var(--fg3); white-space: nowrap; }
+.statline .sum b { color: var(--fg2); font-weight: 600; }
 .method-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(260px, 1fr); gap: 28px; align-items: start; }
 @media (max-width: 760px) { .method-grid { grid-template-columns: 1fr; gap: 16px; } }
 .method-defs { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; }
@@ -769,7 +781,7 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
   <section class="card hero">
     <div class="hero-plots">
       <div class="plot-head">
-        <span class="stat-name" id="risk-label">Risk index</span>
+        <span class="stat-name" id="risk-label">Risk index <a class="info" href="#how" title="How the risk index is calculated" aria-label="How the risk index is calculated">&#9432;</a></span>
         <span class="stat-num" id="risk-num"></span>
         <span class="stat-sub" id="risk-sub">lower is better</span>
         <span class="delta" id="risk-delta"></span>
@@ -788,8 +800,6 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
       <div class="stats" id="stats"></div>
     </div>
   </section>
-
-  <section class="card method" id="grade-note"></section>
 
   <section class="card search">
     <div class="search-row">
@@ -813,6 +823,14 @@ footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border
     <tbody id="rows"></tbody>
   </table>
   <div class="empty" id="empty" style="display:none"></div>
+
+  <!-- Reference material, so it sits after the tests rather than between the
+       headline and them. Collapsed, but one click from the number it explains
+       (the info mark beside "Risk index" opens it). -->
+  <details class="card method" id="how">
+    <summary>How the risk index is calculated</summary>
+    <div id="grade-note"></div>
+  </details>
 
   <footer id="foot"></footer>
 </div>
@@ -1070,7 +1088,24 @@ __NAV_JS__
   $('rate-num').className = 'stat-num';
   $('rate-sub').textContent = nPass + '/' + tests.length;
 
-  $('rate').innerHTML = '<div class="statline">' + st.line + '</div>';
+  // The index's working, beside the sentence it qualifies: which tests produced
+  // the number and what each cost. Named per test while that stays short; past
+  // six it is summed per class instead, and the full table is under "How the
+  // risk index is calculated".
+  var riskCosts = [];
+  ORDER.forEach(function (c) {
+    (byClass[c] || []).forEach(function (x) { riskCosts.push({ id: x.id, w: W[c] || 0 }); });
+  });
+  var riskSum = '';
+  if (risk > 0) {
+    var riskTerms = riskCosts.length <= 6
+      ? riskCosts.map(function (f) { return testLink(f.id) + ' (' + f.w + ')'; })
+      : ORDER.filter(function (c) { return (byClass[c] || []).length; }).map(function (c) {
+          return (byClass[c] || []).length + ' ' + esc(SHORT[c] || LBL[c] || c) + ' \u00d7 ' + (W[c] || 0);
+        });
+    riskSum = ' <span class="sum">\u00b7 risk <b>' + risk + '</b> = ' + riskTerms.join(' + ') + '</span>';
+  }
+  $('rate').innerHTML = '<div class="statline">' + st.line + riskSum + '</div>';
 
   // Bracketed markers link to their footnote, and each footnote links back to
   // the marker that cited it. A citation you cannot follow is decoration.
@@ -1102,8 +1137,10 @@ __NAV_JS__
     return '<div class="gl"><b>' + esc(LBL[c] || c) + '</b> ' + esc(GLOSS[c] || '') + '</div>';
   }).join('');
 
-  // Table and definitions sit side by side, both always visible: a number is
-  // only checkable if its working and its terms are on screen together.
+  // Table and definitions side by side, inside the collapsed "How the risk
+  // index is calculated" section at the bottom. The working a reader needs day
+  // to day -- which tests, what each cost -- is on the strip under the charts;
+  // this is the full method, one click from the number via the info mark.
   $('grade-note').innerHTML =
     '<div class="method-grid">' +
     '<div><table class="weights"><thead><tr>' +
@@ -1148,7 +1185,7 @@ __NAV_JS__
     // The label alone is a two-word abbreviation of a whole failure class.
     // "scanned less than asked" means nothing without the sentence behind it,
     // so the glossary entry rides along as the tooltip.
-    if (s.gloss) { b.title = s.gloss; }
+    b.title = (s.gloss ? s.gloss + ' ' : '') + '(click to show only these tests)';
     b.innerHTML = '<b>' + s.n + '</b> ' + s.label;
     b.addEventListener('click', function () { toggleFilter(s.key); });
     statsEl.appendChild(b);
@@ -1179,7 +1216,8 @@ __NAV_JS__
   // reads correctly for it, then pass rate for breadth. Older history entries
   // predate the risk field, so that series plots only the points that have one.
   const riskHist = hist.filter(function (p) { return typeof p.risk === 'number'; });
-  $('risk-label').textContent = 'Risk index';
+  // The label keeps its info mark, so only the text node is (re)set.
+  $('risk-label').firstChild.nodeValue = 'Risk index ';
   if (riskHist.length >= 2) {
     const rPrev = riskHist[riskHist.length - 2].risk, rNow = riskHist[riskHist.length - 1].risk;
     const rd = rNow - rPrev, el = $('risk-delta');
@@ -1807,6 +1845,16 @@ __NAV_JS__
     'Weights live in <span class="mono">.github/data/failure-classes.json</span>; ' +
     'coverage gaps in <span class="mono">.github/data/coverage-gaps.json</span>; ' +
     '<a href="__UP__../">All branches</a>.</div>';
+
+  // Links into the collapsed method section -- the info mark, or a reference's
+  // back-link to a citation inside it -- open it first, or they land on nothing.
+  document.addEventListener('click', function (e) {
+    const a = e.target && e.target.closest && e.target.closest('a[href^="#"]');
+    if (!a) return;
+    const how = $('how');
+    const t = document.querySelector(a.getAttribute('href'));
+    if (how && t && (t === how || how.contains(t))) how.open = true;
+  });
 
   // The theme control lives in the nav (initTheme in site-nav.sh).
 
