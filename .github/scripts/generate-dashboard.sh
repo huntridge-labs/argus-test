@@ -894,7 +894,8 @@ __NAV_JS__
               branches: d.branches || [], up: '../',
               argus: d.argusRepo ? { version: onMain && d.argusVersion ? 'v' + d.argusVersion
                                                     : (d.argusRef || 'main'),
-                                     sha: aSha, href: aHref } : null });
+                                     sha: aSha, href: aHref } : null,
+              run: { date: d.date, href: d.runUrl } });
   const repoUrl = server + '/' + d.repo;
   const srcBase = repoUrl + '/blob/' + (d.selfSha || 'main') + '/';
 

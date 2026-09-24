@@ -19,7 +19,7 @@ emit_nav_css() {
 cat <<'CSSEOF'
 /* --- shared site navigation: one line ---------------------------------- */
 .nav { display:flex; align-items:center; gap:10px; flex-wrap:nowrap;
-       padding-bottom:12px; margin-bottom:14px; border-bottom:1px solid var(--border); }
+       padding-bottom:12px; margin-bottom:22px; border-bottom:1px solid var(--border); }
 .crumbs { display:flex; align-items:center; gap:9px; flex-wrap:nowrap; min-width:0; flex:1;
           white-space:nowrap; overflow:hidden;
           font-size:0.72rem; text-transform:uppercase; letter-spacing:0.07em; font-weight:700; }
@@ -41,11 +41,11 @@ cat <<'CSSEOF'
 .crumbs .bsel select:hover, .crumbs .bsel select:focus-visible { border-bottom-style:solid;
     border-color:var(--fg); outline:none; }
 .crumbs .bsel option { color:initial; text-transform:none; }
-.nav .argus { margin-left:auto; flex:none; font-size:0.72rem; color:var(--fg3); text-decoration:none;
+.nav-right { margin-left:auto; flex:none; display:flex; align-items:center; gap:14px; }
+.nav .argus, .nav .runlink { font-size:0.72rem; color:var(--fg3); text-decoration:none;
     white-space:nowrap; border-bottom:1px solid var(--border); }
-.nav .argus:hover { color:var(--fg); border-color:var(--fg); }
-.nav .argus + .theme-btn { margin-left:12px; }
-.theme-btn { margin-left:auto; flex:none; display:inline-flex; align-items:center; justify-content:center;
+.nav .argus:hover, .nav .runlink:hover { color:var(--fg); border-color:var(--fg); }
+.theme-btn { flex:none; display:inline-flex; align-items:center; justify-content:center;
     width:28px; height:28px; padding:0; background:transparent; color:var(--fg3);
     border:1px solid var(--border); cursor:pointer; }
 .theme-btn:hover, .theme-btn:focus-visible { color:var(--fg); border-color:var(--fg); outline:none; }
@@ -55,7 +55,8 @@ cat <<'CSSEOF'
 @media (max-width:560px) {
   .crumbs .home .word { display:none; }
   .crumbs .bsel select { max-width:18ch; }
-  .nav .argus .aw, .nav .argus .ash { display:none; }
+  .nav .argus .aw, .nav .argus .ash, .nav .runlink .rw, .nav .runlink .rt, .nav .runlink .rz { display:none; }
+  .nav-right { gap:10px; }
 }
 CSSEOF
 }
@@ -69,6 +70,8 @@ cat <<'JSEOF'
 //   root    : relative prefix to the SITE root (defaults to up + '../')
 //   branches: [{slug, name, sha}] -- every branch with a published page
 //   argus   : {version, sha, href} -- the argus version under test, linked
+//   run     : {date, href} -- when this page's results were produced, and the
+//             workflow run that produced them
 //
 // One line: the title (the way back to every branch), the branch and its
 // commit as a picker that keeps you on the same page, the argus version under
@@ -121,8 +124,27 @@ function renderNav(cfg) {
       '<span class="aw">argus </span>' + esc(A.version) +
       (A.sha ? '<span class="ash"> \u00b7 ' + esc(String(A.sha).slice(0, 7)) + '</span>' : '') +
       '</a>' : '';
-  el.innerHTML = '<div class="crumbs">' + html + '</div>' + argus +
-    '<button class="theme-btn" id="' + cfg.el + '-theme" type="button"></button>';
+  // The time and "view run" were two halves of one fact -- which run this is --
+  // so the timestamp IS the link. It is when the board was generated, at the
+  // end of the run, hence "finished" rather than a bare time a reader could take
+  // for the start.
+  var R = cfg.run;
+  var run = '';
+  if (R && R.date) {
+    var dt = String(R.date);                     // "2026-09-23 21:24 UTC"
+    var tag = R.href ? 'a' : 'span';
+    run = '<' + tag + ' class="runlink mono"' + (R.href ? ' href="' + esc(R.href) + '"' : '') +
+          ' title="Results generated ' + esc(dt) + ', at the end of this workflow run' +
+          (R.href ? ' \u2014 open it on GitHub' : '') + '">' +
+          // A phone keeps only the day: for "is this stale" it matters more than
+          // the minute, and the full time is in the tooltip.
+          '<span class="rw">finished </span>' + esc(dt.slice(5, 10)) +
+          '<span class="rt"> ' + esc(dt.slice(11, 16)) + '</span><span class="rz"> UTC</span>' +
+          (R.href ? ' \u2197' : '') + '</' + tag + '>';
+  }
+  el.innerHTML = '<div class="crumbs">' + html + '</div>' +
+    '<div class="nav-right">' + run + argus +
+    '<button class="theme-btn" id="' + cfg.el + '-theme" type="button"></button></div>';
 
   var sel = document.getElementById(cfg.el + '-branch');
   if (sel) {
@@ -276,7 +298,9 @@ function renderHeader(cfg) {
       m.push('<span class="chip chip-ok" title="Workflow files and the Python package both come from this ref.">fully branch-live</span>');
     }
   }
-  if (cfg.date)  { m.push(esc(cfg.date)); }
+  // The date and the run link are in the nav too (as one "finished … \u2197"
+  // item). What is left here is only what is worth a line when it applies.
+  if (cfg.showRun && cfg.date)  { m.push(esc(cfg.date)); }
   // Push and the weekly run are always 'all', so saying so told the reader
   // nothing. A manual partial run is worth flagging: the suites it skipped
   // show as not run, and that should not read as a gap in argus.
@@ -284,9 +308,12 @@ function renderHeader(cfg) {
     m.push('<span class="chip chip-warn" title="A manual run of one scope. Suites outside it did not run.">' +
            'partial run: ' + esc(cfg.scope) + ' only</span>');
   }
-  if (cfg.runUrl) { m.push('<a href="' + esc(cfg.runUrl) + '">view run &#8599;</a>'); }
+  if (cfg.showRun && cfg.runUrl) { m.push('<a href="' + esc(cfg.runUrl) + '">view run &#8599;</a>'); }
 
-  document.getElementById(cfg.metaEl).innerHTML = m.join('<span class="sep">&middot;</span>');
+  var metaEl = document.getElementById(cfg.metaEl);
+  metaEl.innerHTML = m.join('<span class="sep">&middot;</span>');
+  // Usually empty now; an empty line would still take its margin.
+  metaEl.style.display = m.length ? '' : 'none';
 }
 JSEOF
 }
