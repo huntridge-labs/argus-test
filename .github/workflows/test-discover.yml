@@ -3,6 +3,11 @@ name: "Discover Mode Tests"
 on:
   workflow_call:
     inputs:
+      expected_failures:
+        description: 'JSON array of test ids from .github/data/expected-failures.json. A listed test still runs and still reports FAIL; its job just does not fail the run.'
+        required: false
+        type: string
+        default: '[]'
       argus_ref:
         description: 'Argus branch/tag to test'
         required: false
@@ -39,6 +44,10 @@ permissions:
 jobs:
   discover:
     name: "${{ matrix.t.id }}: ${{ matrix.t.name }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), matrix.t.id) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:

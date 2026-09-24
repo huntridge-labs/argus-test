@@ -116,6 +116,28 @@ jobs:
   # ==========================================================================
   # Unit Tests (U1-U5)
   # ==========================================================================
+  # ==========================================================================
+  # Known argus failures (.github/data/expected-failures.json). Read once and
+  # handed to the suites -- a listed test's job may fail without failing the run
+  # -- and to the summary, which goes red on a NEW failure or on a listed test
+  # that starts passing. Never fails itself: every suite depends on it.
+  # ==========================================================================
+  expected-failures:
+    name: "Load expected failures"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      ids: ${{ steps.load.outputs.ids }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/data
+      - id: load
+        run: |
+          IDS=$(jq -c '[.expected[].id]' .github/data/expected-failures.json 2>/dev/null) || IDS='[]'
+          echo "ids=${IDS:-[]}" >> "$GITHUB_OUTPUT"
+          echo "Known argus failures: ${IDS:-[]}"
+
   unit-tests:
     name: "Unit Tests"
     if: inputs.scope == 'all' || inputs.scope == 'unit' || github.event_name == 'schedule' || github.event_name == 'push'
@@ -139,10 +161,11 @@ jobs:
   remote-tests:
     name: "Remote Mode Tests"
     if: inputs.scope == 'all' || inputs.scope == 'remote' || github.event_name == 'schedule' || github.event_name == 'push'
-    needs: reap-orphans
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-remote.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # Discover Mode Tests (D1-D3)
@@ -150,10 +173,11 @@ jobs:
   discover-tests:
     name: "Discover Mode Tests"
     if: inputs.scope == 'all' || inputs.scope == 'discover' || github.event_name == 'schedule' || github.event_name == 'push'
-    needs: reap-orphans
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-discover.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # Runtime Environment Tests (N1-N5)
@@ -167,9 +191,11 @@ jobs:
   runtime-env-tests:
     name: "Runtime Environment Tests"
     if: inputs.scope == 'all' || inputs.scope == 'runtime-env' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: expected-failures
     uses: ./.github/workflows/test-runtime-env.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # Combination / Pairwise Tests (C1-C15)
@@ -177,10 +203,11 @@ jobs:
   combination-tests:
     name: "Combination Tests"
     if: inputs.scope == 'all' || inputs.scope == 'combination' || github.event_name == 'schedule' || github.event_name == 'push'
-    needs: reap-orphans
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-combination.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # Edge & Adversarial Tests (E1-E12)
@@ -188,10 +215,11 @@ jobs:
   edge-tests:
     name: "Edge & Adversarial Tests"
     if: inputs.scope == 'all' || inputs.scope == 'edge' || github.event_name == 'schedule' || github.event_name == 'push'
-    needs: reap-orphans
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-edge.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # Top-level Workflow Tests (W1-W4)
@@ -199,10 +227,11 @@ jobs:
   workflow-tests:
     name: "Top-level Workflow Tests"
     if: inputs.scope == 'all' || inputs.scope == 'workflows' || github.event_name == 'schedule' || github.event_name == 'push'
-    needs: reap-orphans
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-workflows.yml
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
 
   # ==========================================================================
   # SCN Detector Tests (S1-S25)
@@ -496,6 +525,7 @@ jobs:
       - i4-dispatch-targets-cover-refs
       - i6-no-duplicate-tests
       - runtime-env-tests
+      - expected-failures
     if: always()
     # No `environment:` here. The github-pages environment restricts deployment
     # to main, and an environment gate rejects the job before any step runs --
@@ -802,9 +832,15 @@ jobs:
             echo "**Total: $TOTAL tests** &nbsp; :white_check_mark: $PASSED passed &nbsp; :x: $FAILED failed &nbsp; :next_track_button: $SKIPPED skipped"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail if any test category failed
+      # Red on what CHANGED, not on what is known. A test in
+      # expected-failures.json that fails is a known argus bug: noted, not red.
+      # Red is a failure not on that list, a listed test that PASSES (argus
+      # fixed it -- remove the entry so the list cannot go stale), or a category
+      # that failed without reporting a failing test (it broke before it could).
+      - name: Fail on a new failure, or on a known one that is fixed
         id: verdict
         env:
+          XF: ${{ needs.expected-failures.outputs.ids || '[]' }}
           UNIT: ${{ needs.unit-tests.result }}
           ACTIONS: ${{ needs.action-tests.result }}
           REMOTE: ${{ needs.remote-tests.result }}
@@ -813,22 +849,39 @@ jobs:
           EDGE: ${{ needs.edge-tests.result }}
           WF: ${{ needs.workflow-tests.result }}
           SCN: ${{ needs.scn-tests.result }}
+          RUNTIME: ${{ needs.runtime-env-tests.result }}
           I1: ${{ needs.i1-happy-path.result }}
           I2: ${{ needs.i2-no-hardcoded-urls.result }}
           I3: ${{ needs.i3-config-scan.result }}
+          I4: ${{ needs.i4-dispatch-targets-cover-refs.result }}
+          I5: ${{ needs.i5-infrastructure-scan.result }}
           I6: ${{ needs.i6-no-duplicate-tests.result }}
         run: |
-          FAILED=0
-          for result in "$UNIT" "$ACTIONS" "$REMOTE" "$DISCOVER" "$COMBO" "$EDGE" "$WF" "$SCN" "$I1" "$I2" "$I3" "$I6"; do
-            [ "$result" = "failure" ] && FAILED=$((FAILED + 1))
+          set -uo pipefail
+          jq -e 'type == "array"' <<<"$XF" >/dev/null 2>&1 || XF='[]'
+          ALL="${ALL_JSON:-[]}"
+          NEW=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] - $xf | join(" ")' <<<"$ALL")
+          FIXED=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "pass") | .id] as $p | [$xf[] | select(. as $i | $p | index($i))] | join(" ")' <<<"$ALL")
+          KNOWN=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] as $f | [$xf[] | select(. as $i | $f | index($i))] | join(" ")' <<<"$ALL")
+          CATS=0
+          for result in "$UNIT" "$ACTIONS" "$REMOTE" "$DISCOVER" "$COMBO" "$EDGE" "$WF" "$SCN" "$RUNTIME" "$I1" "$I2" "$I3" "$I4" "$I5" "$I6"; do
+            [ "$result" = "failure" ] && CATS=$((CATS + 1))
           done
 
-          if [ "$FAILED" -gt 0 ]; then
+          [ -n "$KNOWN" ] && echo "::notice title=Known argus failures::$KNOWN -- listed in .github/data/expected-failures.json with their upstream issues."
+          [ -n "$NEW" ] && echo "::error title=New failures::$NEW -- not in expected-failures.json."
+          [ -n "$FIXED" ] && echo "::error title=Expected failure now passes::$FIXED -- argus appears to have fixed this. Remove it from .github/data/expected-failures.json."
+          # A category can fail only through an unlisted test (already counted
+          # above) or by breaking before it reported; count the second kind.
+          if [ -z "$NEW" ] && [ "$CATS" -gt 0 ]; then
+            echo "::error::$CATS job(s) failed without reporting a failing test -- a category broke before it could report."
+          fi
+
+          if [ -n "$NEW" ] || [ -n "$FIXED" ] || { [ -z "$NEW" ] && [ "$CATS" -gt 0 ]; }; then
             echo "suite_failed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::$FAILED test category(ies) failed"
           else
             echo "suite_failed=false" >> "$GITHUB_OUTPUT"
-            echo "All test categories passed or were skipped"
+            echo "Every failure is a known argus bug; nothing new, nothing fixed."
           fi
 
       # ---- Dashboard generation & deployment ----
@@ -1177,11 +1230,15 @@ jobs:
   # flight -- 42 jobs killed by cancel-in-progress and by the next run's
   # reap-orphans -- and the summary still published 62 of 88 tests as the
   # current state of main.
-  # Publishing from any assessed branch needs the github-pages environment to
-  # allow it. The environment's deployment branch policy is repo configuration,
-  # not workflow code, so it is listed in the README: main, dev, feat/*, fix/*.
-  # A branch the policy rejects fails here at the environment gate with no
-  # steps run -- loudly, rather than silently skipping.
+  # WHERE THIS PUBLISHES. main always. Other assessed branches only when the
+  # repository opts in with the variable PUBLISH_ALL_BRANCHES=true -- which also
+  # needs its github-pages environment to allow those branches. That is repo
+  # configuration, not workflow code: the fork that hosts per-branch boards sets
+  # both; a repository that deploys from main only sets neither, and this job is
+  # SKIPPED on its other branches instead of failing at the environment gate
+  # with no steps run. A deploy the repository does not allow is not a test
+  # failure, and reporting it as one made every non-main run red for a setting.
+  # The rendered board is still uploaded as an artifact on every branch.
   publish:
     name: "Publish dashboard"
     runs-on: ubuntu-latest
@@ -1190,8 +1247,10 @@ jobs:
       always() && !cancelled()
       && needs.summary.result != 'skipped'
       && needs.summary.outputs.run_complete == 'true'
-      && (github.ref_name == 'main' || github.ref_name == 'dev'
-          || startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'fix/'))
+      && (github.ref_name == 'main'
+          || (vars.PUBLISH_ALL_BRANCHES == 'true'
+              && (github.ref_name == 'dev'
+                  || startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'fix/'))))
     permissions:
       contents: read      # checkout is not used here, but download-artifact reads the run
       actions: read       # download-artifact@v4

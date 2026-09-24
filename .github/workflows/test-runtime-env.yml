@@ -3,6 +3,11 @@ name: "Runtime Environment Tests"
 on:
   workflow_call:
     inputs:
+      expected_failures:
+        description: 'JSON array of test ids from .github/data/expected-failures.json. A listed test still runs and still reports FAIL; its job just does not fail the run.'
+        required: false
+        type: string
+        default: '[]'
       argus_ref:
         description: 'Argus branch/tag to test'
         required: false
@@ -72,6 +77,10 @@ jobs:
   # --------------------------------------------------------------------------
   n1-n2-daemonless:
     name: "N1/N2: daemonless runner split"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N1') || contains(fromJSON(inputs.expected_failures || '[]'), 'N2') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -314,13 +323,20 @@ jobs:
   # --------------------------------------------------------------------------
   n3-unscannable-exit-code:
     name: "N3: unscannable image exits 2"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N3') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # N3 can fail two ways that mean different things (failure-classes.json):
     # exit 0 is fail-open -- nothing scanned, caller sees a pass; exit 1 still
     # stops the pipeline, so it is fail-closed. The step says which.
+    # The step records its own verdict: when this job may fail without failing
+    # the run (continue-on-error), the job's result is not a reliable signal.
     outputs:
       class: ${{ steps.n3.outputs.class }}
+      verdict: ${{ steps.n3.outputs.verdict }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -352,12 +368,13 @@ jobs:
           set -e
           tail -30 n3.log
           case "$RC" in
-            2) echo "PASS N3: unscannable image exited 2 as the contract requires" ;;
-            0) echo "class=open" >> "$GITHUB_OUTPUT"
+            2) echo "verdict=pass" >> "$GITHUB_OUTPUT"
+               echo "PASS N3: unscannable image exited 2 as the contract requires" ;;
+            0) echo "class=open" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
                echo "::error title=N3::An unpullable image exited 0. Nothing was scanned and the caller sees a pass -- 'nothing could be scanned' is never 0."; exit 1 ;;
-            1) echo "class=closed" >> "$GITHUB_OUTPUT"
+            1) echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
                echo "::error title=N3::An unpullable image exited 1, which means 'findings at or above the threshold'. A caller distinguishing a failing gate from a broken scan would read this as real findings. Expected 2."; exit 1 ;;
-            *) echo "class=closed" >> "$GITHUB_OUTPUT"
+            *) echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
                echo "::error title=N3::Expected exit 2, got $RC."; exit 1 ;;
           esac
 
@@ -388,6 +405,10 @@ jobs:
   # --------------------------------------------------------------------------
   n4-retry-platform:
     name: "N4: retry names a published platform"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N4') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -533,6 +554,10 @@ jobs:
   # --------------------------------------------------------------------------
   n5-local-image-platform-pin:
     name: "N5: local image with a platform pin"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N5') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # Three ways to fail, three classes: a non-zero exit stops the pipeline
@@ -611,7 +636,7 @@ jobs:
           tail -40 n5.log
 
           if [ "$RC" -ne 0 ]; then
-            echo "class=closed" >> "$GITHUB_OUTPUT"
+            echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::Scanning a locally-built, never-pushed image with --platform linux/$OTHER exited $RC. The requested variant is not in the cache and no registry can be consulted, so argus must fall back to the cached variant and say so -- not attempt a registry pull that cannot succeed. This is the air-gapped and docker-load shape."
             exit 1
           fi
@@ -619,16 +644,17 @@ jobs:
           # The cached variant is linux/$HOST_ARCH, not the linux/$OTHER that
           # was asked for. The report has to name what it actually looked at.
           if ! grep -qiE "(platform|architecture|arch)" n5.log; then
-            echo "class=open" >> "$GITHUB_OUTPUT"
+            echo "class=open" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::The scan exited 0 but never mentions a platform or architecture. It scanned the cached linux/$HOST_ARCH variant while the caller asked for linux/$OTHER; a substitution nobody is told about is a scan of the wrong thing reported as the right thing."
             exit 1
           fi
           if ! grep -qiE "$HOST_ARCH" n5.log; then
-            echo "class=auxiliary" >> "$GITHUB_OUTPUT"
+            echo "class=auxiliary" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
             echo "::error title=N5::The output mentions a platform but never names linux/$HOST_ARCH, the variant actually scanned. The warning has to say which architecture the findings describe, not merely that a substitution happened."
             exit 1
           fi
           echo "PASS N5: fell back to the cached linux/$HOST_ARCH variant and named it"
+          echo "verdict=pass" >> "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------------------------
   collect-results:
@@ -655,6 +681,7 @@ jobs:
           PAIR_WHY: ${{ needs.n1-n2-daemonless.outputs.reason }}
           N3: ${{ needs.n3-unscannable-exit-code.result }}
           N3_CLASS: ${{ needs.n3-unscannable-exit-code.outputs.class }}
+          N3_RAW: ${{ needs.n3-unscannable-exit-code.outputs.verdict }}
           N4: ${{ needs.n4-retry-platform.result }}
           N4_RAW: ${{ needs.n4-retry-platform.outputs.verdict }}
           N4_WHY: ${{ needs.n4-retry-platform.outputs.reason }}
@@ -688,7 +715,7 @@ jobs:
             --arg n1 "$(half "$N1_RAW" "$PAIR_RESULT")" \
             --arg n2 "$(half "$N2_RAW" "$PAIR_RESULT")" \
             --arg pairwhy "$PAIR_WHY" \
-            --arg n3 "$(to_status "$N3")" \
+            --arg n3 "$(half "$N3_RAW" "$N3")" \
             --arg n4 "$(half "$N4_RAW" "$N4")" \
             --arg n4why "$N4_WHY" \
             --arg n5 "$(half "$N5_RAW" "$N5")" \

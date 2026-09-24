@@ -467,13 +467,13 @@ dispatched run installs the SDK from `setup-argus@<tag>` no matter what
 `argus_ref` says. These check argus out at the ref and drive the CLI directly,
 which is also the only place the raw exit code is visible.
 
-| ID | Asserts | Currently |
+| ID | Asserts | Against argus `main` (1.12.6) |
 |----|---------|-----------|
-| **N1** | A default scan exits `0` on a runner with trivy and grype but **no container runtime**, and names the sub-scanners that could not run | expected red — reviewer blocker 1 |
-| **N2** | `--scanners exposure` on that same host exits **non-zero** | expected green |
-| **N3** | An unpullable image exits **`2`**, not `0` and not `1` | expected red until released |
-| **N4** | A failed pull retries against a platform the **manifest publishes**, never a hardcoded `linux/amd64` | expected red — reviewer blocker 4 |
-| **N5** | A locally-built, never-pushed image scans under an explicit `--platform`, and **names the architecture** the findings actually describe | expected red — reviewer blocker 3 |
+| **N1** | A default scan exits `0` on a runner with trivy and grype but **no container runtime**, and names the sub-scanners that could not run | green |
+| **N2** | `--scanners exposure` on that same host exits **non-zero** | green |
+| **N3** | An unpullable image exits **`2`**, not `0` and not `1` | green |
+| **N4** | A failed pull retries against a platform the **manifest publishes**, never a hardcoded `linux/amd64` | green |
+| **N5** | A locally-built, never-pushed image scans under an explicit `--platform`, and **names the architecture** the findings actually describe | red — known argus bug, [argus#436](https://github.com/huntridge-labs/argus/issues/436) |
 
 N1 and N2 are asserted in **one job**, deliberately. They are the two halves of
 the same split — "not asked for and cannot run here" versus "explicitly
@@ -530,11 +530,24 @@ gh run watch
 run is ~95 jobs plus child argus runs, so a scratch branch pushed twice a
 minute would swamp the runner pool and the dispatch targets.
 
-Publishing also needs the **`github-pages` environment** to allow the branch.
-That is repo configuration, not workflow code, so it has to be kept in step
-with the trigger list — the policy currently allows `main`, `dev`, `feat/*`
-and `fix/*`. A branch the policy rejects fails at the environment gate with no
-steps run, which is at least loud.
+Every assessed branch renders the board and uploads it as a `dashboard-<slug>`
+artifact. **Publishing** to Pages happens from `main`, and from the other
+assessed branches only when the repository opts in: set the repository variable
+**`PUBLISH_ALL_BRANCHES=true`** *and* let the **`github-pages` environment**
+deploy those branches (`dev`, `feat/*`, `fix/*`). Both are repo configuration,
+not workflow code. A repository that deploys from `main` only sets neither, and
+the publish job is **skipped** on its other branches rather than failing at the
+environment gate: a deploy the repository does not allow is not a test failure.
+
+### Known argus failures
+
+[`.github/data/expected-failures.json`](.github/data/expected-failures.json)
+lists tests that fail because of a known argus bug with an open upstream issue.
+A listed test still runs, still reports FAIL and still counts on the board (its
+row names the issue). What changes is the check: its job does not fail the run.
+The run is red on a **new** failure, or when a listed test **passes** — argus
+fixed it, so the entry has to go before the list goes stale. Only an argus bug
+belongs there; a test that is wrong is fixed, not listed.
 
 A branch publishes at its **slug**: `feat/foo` renders at `/feat-foo/` and
 displays as `feat/foo`. Artifact names reject `/`, and a nested directory would

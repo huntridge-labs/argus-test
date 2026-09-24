@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "Tests that fail because of a KNOWN argus bug with an open upstream issue.",
+    "",
+    "A listed test still runs, still reports FAIL, and still counts on the board",
+    "-- in the risk index and the pass rate -- because the bug is real. What",
+    "changes is the CHECK: its job does not fail the workflow run, so the run is",
+    "green when everything matches what is known, and red only when something",
+    "changes:",
+    "",
+    "  a test fails that is NOT listed here   -> red (a new failure);",
+    "  a test listed here PASSES              -> red (argus fixed it: remove the",
+    "                                           entry, or the list goes stale).",
+    "",
+    "Only list a test whose failure is argus's, with the issue that tracks it. A",
+    "test that is wrong is fixed, not listed.",
+    "",
+    "Wiring: the dispatch matrices (remote, discover, combination, edge,",
+    "workflows) and the runtime-environment jobs read this list. A test elsewhere",
+    "needs its job given the same continue-on-error expression before listing it",
+    "will keep the run green; until then its job still fails the run, which is",
+    "loud rather than silent."
+  ],
+  "expected": [
+    {
+      "id": "N5",
+      "issue": "huntridge-labs/argus#436",
+      "why": "scan container ignores --platform when the image is already in the local daemon, and scans the cached architecture without saying so"
+    },
+    {
+      "id": "E13",
+      "issue": "huntridge-labs/argus#437",
+      "why": "remote container scans skip ADR-038's platform detection, so a public arm64-only image fails from an amd64 runner"
+    }
+  ]
+}

@@ -79,6 +79,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/site-nav.sh"
 # ---------- failure classes (what a red test costs a consumer) ------------
 CLASSES_FILE="$SCRIPT_DIR/../data/failure-classes.json"
+# Known argus failures, so their rows say so and link the upstream issue. The
+# same list keeps them from failing the run (see test-suite.yml's verdict).
+XF_FILE="$SCRIPT_DIR/../data/expected-failures.json"
+XF_JSON=$(jq -c '[.expected[]? | {id, issue, why}]' "$XF_FILE" 2>/dev/null) || XF_JSON='[]'
+[ -n "$XF_JSON" ] || XF_JSON='[]'
 if [ -f "$CLASSES_FILE" ] && jq empty "$CLASSES_FILE" 2>/dev/null; then
   CLASSES_JSON=$(jq -c '{default, weights, labels, short, glossary, status, index, descriptions, classes, references}' "$CLASSES_FILE")
 else
@@ -855,6 +860,7 @@ HTMLEOF
   printf '  retiredGaps: %s,\n' "$RETIRED_JSON"
   printf '  liveness: %s,\n' "$LIVENESS_JSON"
   printf '  failureClasses: %s,\n' "$CLASSES_JSON"
+  printf '  expectedFailures: %s,\n' "$XF_JSON"
   printf '  catalog: %s,\n' "$CATALOG_JSON"
   printf '  jobs: %s,\n' "${JOBS_JSON:-[]}"
   printf '  branches: %s,\n' "${BRANCHES_JSON:-[]}"
@@ -1485,6 +1491,20 @@ __NAV_JS__
     return x.status === 'pass' ? 'pass' : x.status === 'FAIL' ? 'fail'
       : x.status === 'notrun' ? 'idle' : 'skip';
   }
+  // A failing test on the expected-failures list is a known argus bug: still
+  // red, still scored, but the row says which upstream issue tracks it, so known
+  // red and new red are not the same colour of alarm.
+  const XF = {};
+  (d.expectedFailures || []).forEach(function (e) { XF[e.id] = e; });
+  function knownNote(x) {
+    const e = x.status === 'FAIL' && XF[x.id];
+    if (!e) return '';
+    const m = /^([^#]+)#(\d+)$/.exec(e.issue || '');
+    const link = m ? '<a href="' + server + '/' + esc(m[1]) + '/issues/' + m[2] + '">' + esc(e.issue) + '</a>'
+                   : esc(e.issue || '');
+    return '<div class="why known">Known argus bug, tracked in ' + link +
+           (e.why ? ': ' + esc(e.why) : '') + '. Does not fail the run.</div>';
+  }
   function statusTitle(x) {
     if (x.kind === 'gap') return 'Known gap here, and not covered by argus CI either';
     if (x.kind === 'untested') return 'Untested anywhere - neither here nor in argus CI';
@@ -1591,6 +1611,7 @@ __NAV_JS__
           : '') + '</td>' +
       '<td class="c-q"><span class="qt">' + esc(x.question || x.name) + '</span>' +
         (x.why ? '<div class="why">' + esc(x.why) + '</div>' : '') +
+        knownNote(x) +
         (notRunNote(x) ? '<div class="why">' + esc(notRunNote(x)) + '</div>' : '') +
         checksLine(x) + '</td>' +
       '<td class="c-cat">' + esc(x.category) + '</td>' +
