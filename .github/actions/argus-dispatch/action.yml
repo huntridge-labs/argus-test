@@ -112,12 +112,38 @@ runs:
           fail "Could not dispatch $WF after 5 attempts. Last error from gh: $(tr '\n' ' ' < /tmp/dispatch-err). Check that it exists on the DEFAULT branch, that this job has actions: write, and that every input value is a string."
         fi
 
+        # THE API BUDGET. github.token allows 1,000 REST requests per hour per
+        # repository, shared by every job in the run. ~40 of these run at once;
+        # at the old cadence (a lookup every 5s, then a status poll every 15s)
+        # one suite run made ~4,000 calls, the budget ran out part way, and every
+        # poll after that failed silently -- `2>/dev/null || echo unknown` -- so
+        # child runs that SUCCEEDED were reported as "did not finish" (runs
+        # 35913556488 and 36006548670: 12 and 26 tests, all of them this).
+        #
+        # So: poll about once a minute, and when a call is refused, ask when the
+        # budget resets (GET /rate_limit does not count against it), wait for
+        # that, and add the wait to the deadline -- a throttle is not the child
+        # taking too long.
+        throttle_wait() {
+          local reset now wait
+          reset=$(gh api rate_limit --jq '.resources.core | select(.remaining == 0) | .reset' 2>/dev/null || true)
+          [ -n "$reset" ] || return 1
+          now=$(date +%s); wait=$(( reset - now + 5 ))
+          [ "$wait" -gt 0 ] || return 1
+          [ "$wait" -gt 1200 ] && wait=1200
+          echo "::notice::API budget for this repository is spent; waiting ${wait}s for it to reset."
+          sleep "$wait"
+          THROTTLED=$(( ${THROTTLED:-0} + wait ))
+          return 0
+        }
+
         RID=""
-        for i in $(seq 1 60); do
-          sleep 5
+        for i in $(seq 1 30); do
+          sleep 10
           RID=$(gh run list --workflow="$WF" --limit 100 --json databaseId,displayTitle \
-                --jq "[.[] | select(.displayTitle == \"argus $MARKER\")][0].databaseId" 2>/dev/null || true)
+                --jq "[.[] | select(.displayTitle == \"argus $MARKER\")][0].databaseId" 2>/tmp/lookup-err || true)
           if [ -n "$RID" ] && [ "$RID" != "null" ]; then break; fi
+          if [ -s /tmp/lookup-err ]; then throttle_wait || true; fi
           RID=""
         done
         [ -n "$RID" ] || fail "Dispatched $WF but no run named 'argus $MARKER' appeared within 300s."
@@ -128,14 +154,29 @@ runs:
         echo "argus run: $URL"
 
         DEADLINE=$(( $(date +%s) + TIMEOUT_S ))
-        STATUS=""; CONCL=""
-        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-          read -r STATUS CONCL <<<"$(gh run view "$RID" --json status,conclusion \
-              --jq '"\(.status) \(.conclusion // "-")"' 2>/dev/null || echo "unknown -")"
-          [ "$STATUS" = "completed" ] && break
-          sleep 15
+        STATUS=""; CONCL=""; SEEN=false; LASTERR=""
+        # A child takes minutes: the first look is after ~45s, then about once a
+        # minute with jitter so ~40 pollers do not fire together.
+        sleep 45
+        while [ "$(date +%s)" -lt "$(( DEADLINE + ${THROTTLED:-0} ))" ]; do
+          if OUT=$(gh run view "$RID" --json status,conclusion \
+                     --jq '"\(.status) \(.conclusion // "-")"' 2>/tmp/poll-err); then
+            read -r STATUS CONCL <<<"$OUT"; SEEN=true
+            [ "$STATUS" = "completed" ] && break
+          else
+            LASTERR=$(tr '\n' ' ' < /tmp/poll-err | cut -c1-300)
+            if throttle_wait; then continue; fi
+          fi
+          sleep $(( 50 + RANDOM % 20 ))
         done
-        [ "$STATUS" = "completed" ] || fail "$URL did not finish within ${TIMEOUT_S}s (last status: $STATUS)."
+        if [ "$STATUS" != "completed" ]; then
+          # Never having seen the child is a different failure from watching it
+          # overrun: say which, with gh's own error, instead of "last status: ".
+          if [ "$SEEN" != "true" ]; then
+            fail "Could not read the status of $URL at all (last error from gh: ${LASTERR:-none}). The child may well have finished; this job could not observe it."
+          fi
+          fail "$URL did not finish within ${TIMEOUT_S}s (last status: $STATUS)."
+        fi
 
         echo "observed: $CONCL   expected: $EXPECT"
         if [ "$EXPECT" = "any" ]; then
