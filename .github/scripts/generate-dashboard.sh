@@ -501,32 +501,6 @@ details.working .dir {
 .gl { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; margin-bottom: 5px; max-width: 62ch; }
 .gl b { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track); font-size: 0.64rem; margin-right: 5px; }
 .rate .risk { font-size: 2.2rem; font-weight: 300; line-height: 1; letter-spacing: -0.02em; }
-table.weights th {
-  position: static; background: transparent; border-bottom: 1px solid var(--border);
-  padding: 4px 12px 4px 0; font-size: 0.6rem; color: var(--fg3);
-}
-table.weights td { padding: 4px 12px 4px 0; border-bottom: 1px solid var(--rule); font-size: 0.74rem; }
-table.weights tr.idle td { color: var(--fg3); }
-table.weights td.wc { text-transform: uppercase; letter-spacing: var(--track); font-weight: 700; font-size: 0.64rem; }
-table.weights tr.live td.wc { color: var(--fg); }
-table.weights td.ww, table.weights td.wn, table.weights td.wt {
-  font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; text-align: right;
-}
-/* Each contribution takes its own class colour, and the total takes the same
-   tone as the risk number heading the plot, so the two 24s are visibly the
-   same figure rather than two numbers that happen to match. */
-table.weights tr.live td.wt { font-weight: 700; }
-table.weights tr.fc-open td.wt, table.weights tr.fc-closed td.wt { color: var(--fail-ink); }
-table.weights tr.fc-auxiliary td.wt { color: var(--warn-ink); }
-table.weights tr.total td.wt.v-bad { color: var(--fail-ink); }
-table.weights tr.total td.wt.v-warn { color: var(--warn-ink); }
-table.weights tr.total td.wt.v-good { color: var(--pass-ink); }
-table.weights td.wd { color: var(--fg3); font-size: 0.7rem; }
-table.weights tr.total td { border-bottom: 0; border-top: 1px solid var(--fg3); font-weight: 700; color: var(--fg); }
-table.weights tr.total td.wt { font-size: 0.86rem; }
-table.weights tr.total td:first-child {
-  text-transform: uppercase; letter-spacing: var(--track); font-size: 0.62rem; color: var(--fg2); font-weight: 600;
-}
 .weights-note { font-size: 0.7rem; color: var(--fg3); line-height: 1.6; max-width: 58ch; }
 sup.cite { font-size: 0.58rem; font-weight: 600; margin-left: 3px; letter-spacing: 0; }
 a.tref {
@@ -554,7 +528,7 @@ a.fn-n:hover { border-bottom: 1px solid var(--fg); }
 }
 .fn { display: flex; gap: 8px; font-size: 0.7rem; line-height: 1.6; margin-bottom: 7px; max-width: 92ch; }
 .fn-n { flex: none; color: var(--fg2); font-weight: 700; font-variant-numeric: tabular-nums; }
-.fn a { word-break: break-all; }
+.fn a:not(.fn-n) { border-bottom: 1px solid var(--border); text-decoration: none; }
 .fn-note { display: block; color: var(--fg3); font-style: italic; }
 .foot-meta { font-size: 0.7rem; color: var(--fg3); }
 .fctag {
@@ -647,15 +621,19 @@ details.working[open] > summary { margin-bottom: 8px; }
 .stat-name .info:hover { color: var(--fg); }
 .statline .sum { display: block; margin-top: 3px; color: var(--fg3); font-weight: 400; }
 .statline .sum b { color: var(--fg2); font-weight: 600; }
-.method-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(260px, 1fr); gap: 28px; align-items: start; }
-@media (max-width: 760px) { .method-grid { grid-template-columns: 1fr; gap: 16px; } }
-.method-defs { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; }
-.method-defs .gl { margin-bottom: 7px; max-width: none; }
-.method-defs .caveat {
-  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--rule); color: var(--fg3);
-}
-.method-defs .caveat b { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track); font-size: 0.64rem; }
-table.weights { width: 100%; max-width: none; border-collapse: collapse; margin: 0; }
+.formula { font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; font-size: 0.8rem;
+  color: var(--fg); margin: 2px 0 14px; }
+.formula .mhint { font-family: inherit; color: var(--fg3); font-size: 0.7rem; margin-left: 8px; }
+.mdefs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 0.72rem;
+  line-height: 1.6; color: var(--fg3); margin-bottom: 12px; }
+.mdefs .mk { color: var(--fg2); text-transform: uppercase; letter-spacing: var(--track);
+  font-size: 0.64rem; font-weight: 700; white-space: nowrap; padding-top: 1px; }
+.mdefs .mk .mw { font-family: ui-monospace, 'SFMono-Regular', Consolas, monospace; margin-left: 6px;
+  color: var(--fg3); font-weight: 400; letter-spacing: 0; }
+.mcaveat { font-size: 0.72rem; color: var(--fg3); line-height: 1.6; max-width: 92ch;
+  padding-top: 10px; border-top: 1px solid var(--rule); margin-bottom: 12px; }
+.mrefs .fn { margin-bottom: 5px; }
+@media (max-width: 560px) { .mdefs { grid-template-columns: 1fr; gap: 2px; } .mdefs .mk { padding-top: 8px; } }
 .ax-grid { stroke: var(--rule); stroke-width: 1; }
 .ax-lbl { font-size: 9px; fill: var(--fg3); font-family: inherit; letter-spacing: 0.04em; }
 .pt-lbl { font-size: 9px; font-weight: 600; fill: var(--fg3); font-family: inherit; }
@@ -1140,43 +1118,45 @@ __NAV_JS__
   }
   function testLinks(ids) { return ids.map(testLink).join(', '); }
 
+  const citedOnce = {};
   function citeMark(ns) {
     return '<sup class="cite">' + ns.map(function (n) {
-      return '<a id="cite-' + n + '" href="#ref-' + n + '">[' + n + ']</a>';
+      // Only the first mark carries the id a reference's back-link targets.
+      const id = citedOnce[n] ? '' : ' id="cite-' + n + '"';
+      citedOnce[n] = true;
+      return '<a' + id + ' href="#ref-' + n + '">[' + n + ']</a>';
     }).join(', ') + '</sup>';
   }
 
-  var rows = '';
-  ORDER.forEach(function (c) {
-    const n = (byClass[c] || []).length, w = W[c] || 0;
-    const ids = testLinks((byClass[c] || []).map(function (x) { return x.id; }));
-    rows += '<tr class="' + (n ? 'live fc-' + c : 'idle') + '">' +
-      '<td class="wc" title="' + esc(GLOSS[c] || '') + '">' + esc(LBL[c] || c) +
-        (c === 'open' ? citeMark([1, 2]) : '') + '</td>' +
-      '<td class="ww">&times;' + w + '</td>' +
-      '<td class="wn">' + n + '</td>' +
-      '<td class="wt">' + (n * w) + '</td>' +
-      '<td class="wd">' + (ids || '&mdash;') + '</td></tr>';
-  });
-  const glossHtml = ORDER.map(function (c) {
-    return '<div class="gl"><b>' + esc(LBL[c] || c) + '</b> ' + esc(GLOSS[c] || '') + '</div>';
+  // What the strip under the chart does not already say: the weights, what
+  // each class means, and what the sources do and do not support. The counts
+  // and the tests are on the strip (risk N = A (w) + B (w)), so a table
+  // repeating them here was noise.
+  const formula = 'risk = ' + ORDER.map(function (c) {
+    return (W[c] || 0) + ' &times; ' + esc(SHORT[c] || LBL[c] || c);
+  }).join(' + ') + '<span class="mhint">summed over failing tests</span>';
+  const defs = ORDER.map(function (c) {
+    return '<span class="mk">' + esc(LBL[c] || c) + '<span class="mw">&times;' + (W[c] || 0) + '</span></span>' +
+           '<span>' + esc(GLOSS[c] || '') + (c === 'open' ? citeMark([1, 2]) : '') + '</span>';
   }).join('');
-
-  // Table and definitions side by side, inside the collapsed "How the risk
-  // index is calculated" section at the bottom. The working a reader needs day
-  // to day -- which tests, what each cost -- is on the strip under the charts;
-  // this is the full method, one click from the number via the info mark.
+  // The data file already separates what is cited from what is not; the page
+  // says so too, so the numbers are not read as coming from the literature.
+  const caveat = 'That failing open is worse than failing closed is grounded in the sources' +
+    citeMark([1, 2]) + '; the numbers 10 / 3 / 1 are this suite\u2019s judgement, not a measurement. ' +
+    esc(IDX.caveat || '') + ' Each test is pass/fail rather than scored' + citeMark([3]) + '.';
+  // References live with the claims they support. The title is the link:
+  // printing the URL beside it repeated the destination in a form nobody reads.
+  const refs = REFS.map(function (r) {
+    return '<div class="fn" id="ref-' + r.n + '">' +
+           '<a class="fn-n" href="#cite-' + r.n + '" title="back to where this is cited">[' + r.n + ']</a>' +
+           '<span><a href="' + esc(r.url) + '">' + esc(r.ieee || r.cite || '') + '</a>' +
+           (r.note ? '<span class="fn-note">' + esc(r.note) + '</span>' : '') + '</span></div>';
+  }).join('');
   $('grade-note').innerHTML =
-    '<div class="method-grid">' +
-    '<div><table class="weights"><thead><tr>' +
-      '<th>failure class</th><th>per failure</th><th>n</th><th>weight</th><th>tests</th>' +
-    '</tr></thead><tbody>' + rows +
-    '<tr class="total"><td colspan="3">risk index = &Sigma; weight</td>' +
-    '<td class="wt v-' + (st.tone || 'good') + '">' + risk + '</td><td></td></tr></tbody></table></div>' +
-    '<div class="method-defs">' + glossHtml +
-      '<div class="caveat"><b>On the index.</b> ' + esc(IDX.caveat || '') +
-      ' Each test is itself pass/fail rather than scored' + citeMark([3]) + '.</div>' +
-    '</div></div>';
+    '<div class="formula">' + formula + '</div>' +
+    '<div class="mdefs">' + defs + '</div>' +
+    '<div class="mcaveat">' + caveat + '</div>' +
+    (refs ? '<div class="mrefs footnotes"><div class="fn-head">References</div>' + refs + '</div>' : '');
 
   const hist = d.history || [];
   if (hist.length >= 2) {
@@ -1858,14 +1838,6 @@ __NAV_JS__
   });
 
   $('foot').innerHTML =
-    '<div class="footnotes"><div class="fn-head">References</div>' +
-    REFS.map(function (r) {
-      return '<div class="fn" id="ref-' + r.n + '">' +
-             '<a class="fn-n" href="#cite-' + r.n + '" title="back to where this is cited">[' + r.n + ']</a>' +
-             '<span>' + esc(r.ieee || r.cite || '') +
-             ' <a href="' + esc(r.url) + '">' + esc(r.url) + '</a>' +
-             (r.note ? '<span class="fn-note">' + esc(r.note) + '</span>' : '') + '</span></div>';
-    }).join('') + '</div>' +
     '<div class="foot-meta">Generated by the test suite CI on every push. ' +
     'Weights live in <span class="mono">.github/data/failure-classes.json</span>; ' +
     'coverage gaps in <span class="mono">.github/data/coverage-gaps.json</span>; ' +

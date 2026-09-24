@@ -97,7 +97,7 @@
   "index": {
     "name": "Risk index",
     "direction": "lower is better",
-    "caveat": "The weights are a judgement call, not a measurement. The number adds up rather than averaging, so adding passing tests can never lower it. Only fixing a failure does."
+    "caveat": "The index adds up rather than averaging, so adding passing tests can never lower it; only fixing a failure does."
   },
   "descriptions": {
     "open": "argus reported success without actually running the check. Nothing warns you, so unscanned code can ship looking approved.",
