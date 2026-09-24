@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: '[]'
+      expected_labels:
+        description: 'JSON object mapping a known-failure test id to its upstream issue, shown in the job name.'
+        required: false
+        type: string
+        default: '{}'
       argus_ref:
         description: 'Argus branch/tag to test'
         required: false
@@ -322,7 +327,7 @@ jobs:
   # the only place in the suite where the distinction is observable at all.
   # --------------------------------------------------------------------------
   n3-unscannable-exit-code:
-    name: "N3: unscannable image exits 2"
+    name: "N3: unscannable image exits 2${{ fromJSON(inputs.expected_labels || '{}')['N3'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N3']) || '' }}"
     # A test listed in expected-failures.json (a known argus bug) still runs and
     # still reports FAIL; it just does not fail the run. The summary goes red if
     # a listed test starts passing, so the list cannot go stale.
@@ -404,7 +409,7 @@ jobs:
   #      same lie the suite exists to catch.
   # --------------------------------------------------------------------------
   n4-retry-platform:
-    name: "N4: retry names a published platform"
+    name: "N4: retry names a published platform${{ fromJSON(inputs.expected_labels || '{}')['N4'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N4']) || '' }}"
     # A test listed in expected-failures.json (a known argus bug) still runs and
     # still reports FAIL; it just does not fail the run. The summary goes red if
     # a listed test starts passing, so the list cannot go stale.
@@ -553,7 +558,7 @@ jobs:
   # is a scan of something the caller did not ask about, reported as if it were.
   # --------------------------------------------------------------------------
   n5-local-image-platform-pin:
-    name: "N5: local image with a platform pin"
+    name: "N5: local image with a platform pin${{ fromJSON(inputs.expected_labels || '{}')['N5'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N5']) || '' }}"
     # A test listed in expected-failures.json (a known argus bug) still runs and
     # still reports FAIL; it just does not fail the run. The summary goes red if
     # a listed test starts passing, so the list cannot go stale.

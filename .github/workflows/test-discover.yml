@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: '[]'
+      expected_labels:
+        description: 'JSON object mapping a known-failure test id to its upstream issue, shown in the job name.'
+        required: false
+        type: string
+        default: '{}'
       argus_ref:
         description: 'Argus branch/tag to test'
         required: false
@@ -43,7 +48,7 @@ permissions:
 
 jobs:
   discover:
-    name: "${{ matrix.t.id }}: ${{ matrix.t.name }}"
+    name: "${{ matrix.t.id }}: ${{ matrix.t.name }}${{ fromJSON(inputs.expected_labels || '{}')[matrix.t.id] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')[matrix.t.id]) || '' }}"
     # A test listed in expected-failures.json (a known argus bug) still runs and
     # still reports FAIL; it just does not fail the run. The summary goes red if
     # a listed test starts passing, so the list cannot go stale.

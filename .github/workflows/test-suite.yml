@@ -128,6 +128,7 @@ jobs:
     timeout-minutes: 3
     outputs:
       ids: ${{ steps.load.outputs.ids }}
+      labels: ${{ steps.load.outputs.labels }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,8 +136,12 @@ jobs:
       - id: load
         run: |
           IDS=$(jq -c '[.expected[].id]' .github/data/expected-failures.json 2>/dev/null) || IDS='[]'
+          # id -> issue, e.g. {"N5":"huntridge-labs/argus#436"}
+          LABELS=$(jq -c '[.expected[] | {(.id): .issue}] | add // {}' .github/data/expected-failures.json 2>/dev/null) || LABELS='{}'
           echo "ids=${IDS:-[]}" >> "$GITHUB_OUTPUT"
-          echo "Known argus failures: ${IDS:-[]}"
+          [ -n "$LABELS" ] || LABELS='{}'
+          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
+          echo "Known argus failures: $LABELS"
 
   unit-tests:
     name: "Unit Tests"
@@ -166,6 +171,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Discover Mode Tests (D1-D3)
@@ -178,6 +184,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Runtime Environment Tests (N1-N5)
@@ -196,6 +203,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Combination / Pairwise Tests (C1-C15)
@@ -208,6 +216,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Edge & Adversarial Tests (E1-E12)
@@ -220,6 +229,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Top-level Workflow Tests (W1-W4)
@@ -232,6 +242,7 @@ jobs:
     with:
       argus_ref: ${{ inputs.argus_ref || 'main' }}
       expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # SCN Detector Tests (S1-S25)
@@ -591,6 +602,8 @@ jobs:
           I6: ${{ needs.i6-no-duplicate-tests.result }}
           SCOPE: ${{ inputs.scope || 'all' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          XF: ${{ needs.expected-failures.outputs.ids || '[]' }}
+          XF_LABELS: ${{ needs.expected-failures.outputs.labels || '{}' }}
         run: |
           icon() {
             case "$1" in
@@ -682,15 +695,48 @@ jobs:
           PASSED=$(echo "$ALL" | jq '[.[] | select(.status == "pass")] | length')
           FAILED=$(echo "$ALL" | jq '[.[] | select(.status == "FAIL")] | length')
           SKIPPED=$(echo "$ALL" | jq '[.[] | select(.status == "skip" or .status == "cancel")] | length')
-          RUNNABLE=$((TOTAL - SKIPPED))
-          [ "$RUNNABLE" -eq 0 ] && RUNNABLE=1
-          PASS_RATE=$((PASSED * 100 / RUNNABLE))
+          # The board's pass rate: passed / every test reported, rounded down.
+          # (This line used to exclude skips, so it disagreed with the board.)
+          PASS_RATE=$(( TOTAL > 0 ? PASSED * 100 / TOTAL : 0 ))
 
-          if [ "$FAILED" -eq 0 ] && [ "$PASSED" -gt 0 ]; then
-            VERDICT=":white_check_mark: **PASS**"
+          # THE VERDICT, computed once. The gate step below reads it from
+          # GITHUB_ENV instead of re-deriving it, so the run page can never say
+          # FAIL over a green run again. Red is what CHANGED: a failure not in
+          # expected-failures.json, a listed test that passes (argus fixed it),
+          # a category that failed without reporting a failing test, or nothing
+          # passing at all. A listed failure is a known argus bug: shown, not red.
+          jq -e 'type == "array"' <<<"$XF" >/dev/null 2>&1 || XF='[]'
+          jq -e 'type == "object"' <<<"$XF_LABELS" >/dev/null 2>&1 || XF_LABELS='{}'
+          V_NEW=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] - $xf | join(" ")' <<<"$ALL")
+          V_FIXED=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "pass") | .id] as $p | [$xf[] | select(. as $i | $p | index($i))] | join(" ")' <<<"$ALL")
+          V_KNOWN=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] as $f | [$xf[] | select(. as $i | $f | index($i))] | join(" ")' <<<"$ALL")
+          V_CATS=0
+          for r in "$UNIT_RESULT" "$ACTIONS_RESULT" "$REMOTE_RESULT" "$DISCOVER_RESULT" "$COMBO_RESULT" "$EDGE_RESULT" "$WF_RESULT" "$SCN_RESULT" "$RUNTIME_RESULT" "$I1" "$I2" "$I3" "$I4" "$I5" "$I6"; do
+            [ "$r" = "failure" ] && V_CATS=$((V_CATS + 1))
+          done
+          V_BROKE=0; [ -z "$V_NEW" ] && V_BROKE=$V_CATS
+          if [ -n "$V_NEW" ] || [ -n "$V_FIXED" ] || [ "$V_BROKE" -gt 0 ] || [ "$PASSED" -eq 0 ]; then
+            SUITE_FAILED=true;  VERDICT=":x: **FAIL**"
           else
-            VERDICT=":x: **FAIL**"
+            SUITE_FAILED=false; VERDICT=":white_check_mark: **PASS**"
           fi
+          {
+            echo "V_NEW=$V_NEW"; echo "V_FIXED=$V_FIXED"; echo "V_KNOWN=$V_KNOWN"
+            echo "V_BROKE=$V_BROKE"; echo "SUITE_FAILED=$SUITE_FAILED"
+          } >> "$GITHUB_ENV"
+          # "N5 ([huntridge-labs/argus#436](https://github.com/huntridge-labs/argus/issues/436))"
+          with_issue() {
+            local out="" id iss
+            for id in $1; do
+              iss=$(jq -r --arg i "$id" '.[$i] // empty' <<<"$XF_LABELS")
+              if [[ "$iss" =~ ^([^#]+)#([0-9]+)$ ]]; then
+                out+="${out:+, }$id ([$iss](${GITHUB_SERVER_URL}/${BASH_REMATCH[1]}/issues/${BASH_REMATCH[2]}))"
+              else
+                out+="${out:+, }$id"
+              fi
+            done
+            echo "${out:-&mdash;}"
+          }
 
           # Helper: count pass/fail/skip within a JSON array
           cat_icon() {
@@ -718,6 +764,13 @@ jobs:
             echo ""
             echo "**Scope:** \`$SCOPE\` &nbsp; **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "**Verdict:** $VERDICT &nbsp; ($PASSED passed, $FAILED failed, $SKIPPED skipped — $PASS_RATE% pass rate)"
+            echo ""
+            echo "| Why the run is this colour | Tests |"
+            echo "|---|---|"
+            echo "| Known argus failures — red on their own jobs, but they do not fail the run | $(with_issue "$V_KNOWN") |"
+            echo "| New failures — these fail the run | ${V_NEW:-&mdash;} |"
+            echo "| Known failures that now pass — remove from \`expected-failures.json\` | ${V_FIXED:-&mdash;} |"
+            [ "$V_BROKE" -gt 0 ] && echo "| Categories that failed without reporting a failing test | $V_BROKE |"
             echo ""
             echo "---"
             echo ""
@@ -839,50 +892,16 @@ jobs:
       # that failed without reporting a failing test (it broke before it could).
       - name: Fail on a new failure, or on a known one that is fixed
         id: verdict
-        env:
-          XF: ${{ needs.expected-failures.outputs.ids || '[]' }}
-          UNIT: ${{ needs.unit-tests.result }}
-          ACTIONS: ${{ needs.action-tests.result }}
-          REMOTE: ${{ needs.remote-tests.result }}
-          DISCOVER: ${{ needs.discover-tests.result }}
-          COMBO: ${{ needs.combination-tests.result }}
-          EDGE: ${{ needs.edge-tests.result }}
-          WF: ${{ needs.workflow-tests.result }}
-          SCN: ${{ needs.scn-tests.result }}
-          RUNTIME: ${{ needs.runtime-env-tests.result }}
-          I1: ${{ needs.i1-happy-path.result }}
-          I2: ${{ needs.i2-no-hardcoded-urls.result }}
-          I3: ${{ needs.i3-config-scan.result }}
-          I4: ${{ needs.i4-dispatch-targets-cover-refs.result }}
-          I5: ${{ needs.i5-infrastructure-scan.result }}
-          I6: ${{ needs.i6-no-duplicate-tests.result }}
         run: |
-          set -uo pipefail
-          jq -e 'type == "array"' <<<"$XF" >/dev/null 2>&1 || XF='[]'
-          ALL="${ALL_JSON:-[]}"
-          NEW=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] - $xf | join(" ")' <<<"$ALL")
-          FIXED=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "pass") | .id] as $p | [$xf[] | select(. as $i | $p | index($i))] | join(" ")' <<<"$ALL")
-          KNOWN=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] as $f | [$xf[] | select(. as $i | $f | index($i))] | join(" ")' <<<"$ALL")
-          CATS=0
-          for result in "$UNIT" "$ACTIONS" "$REMOTE" "$DISCOVER" "$COMBO" "$EDGE" "$WF" "$SCN" "$RUNTIME" "$I1" "$I2" "$I3" "$I4" "$I5" "$I6"; do
-            [ "$result" = "failure" ] && CATS=$((CATS + 1))
-          done
-
-          [ -n "$KNOWN" ] && echo "::notice title=Known argus failures::$KNOWN -- listed in .github/data/expected-failures.json with their upstream issues."
-          [ -n "$NEW" ] && echo "::error title=New failures::$NEW -- not in expected-failures.json."
-          [ -n "$FIXED" ] && echo "::error title=Expected failure now passes::$FIXED -- argus appears to have fixed this. Remove it from .github/data/expected-failures.json."
-          # A category can fail only through an unlisted test (already counted
-          # above) or by breaking before it reported; count the second kind.
-          if [ -z "$NEW" ] && [ "$CATS" -gt 0 ]; then
-            echo "::error::$CATS job(s) failed without reporting a failing test -- a category broke before it could report."
-          fi
-
-          if [ -n "$NEW" ] || [ -n "$FIXED" ] || { [ -z "$NEW" ] && [ "$CATS" -gt 0 ]; }; then
-            echo "suite_failed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "suite_failed=false" >> "$GITHUB_OUTPUT"
-            echo "Every failure is a known argus bug; nothing new, nothing fixed."
-          fi
+          # Computed once in "Generate consolidated summary" (see there) and
+          # read from GITHUB_ENV, so the gate and the run page cannot disagree.
+          [ -n "${V_KNOWN:-}" ] && echo "::notice title=Known argus failures::$V_KNOWN -- listed in .github/data/expected-failures.json with their upstream issues."
+          [ -n "${V_NEW:-}" ] && echo "::error title=New failures::$V_NEW -- not in expected-failures.json."
+          [ -n "${V_FIXED:-}" ] && echo "::error title=Expected failure now passes::$V_FIXED -- argus appears to have fixed this. Remove it from .github/data/expected-failures.json."
+          [ "${V_BROKE:-0}" -gt 0 ] && echo "::error::$V_BROKE job(s) failed without reporting a failing test -- a category broke before it could report."
+          echo "suite_failed=${SUITE_FAILED:-true}" >> "$GITHUB_OUTPUT"
+          [ "${SUITE_FAILED:-true}" = "false" ] && echo "Every failure is a known argus bug; nothing new, nothing fixed."
+          exit 0
 
       # ---- Dashboard generation & deployment ----
       - name: Checkout repository
