@@ -1,0 +1,196 @@
+name: "Dispatch any argus workflow and assert its outcome"
+description: >
+  Generic form of argus-scan: dispatches a named dispatch-target workflow with
+  an arbitrary JSON input object, waits for that run, and asserts its
+  conclusion. The calling job is green exactly when the assertion holds.
+
+# NOTE: argus-scan does the same thing for container-scan specifically. The two
+# should be consolidated -- argus-scan predates this and is already proven
+# against the four container suites, so it was left alone rather than rewritten
+# underneath working tests. Consolidating is a follow-up, not a rewrite to do
+# while the conversion is still being validated.
+
+inputs:
+  workflow:
+    description: "Dispatch-target workflow file, e.g. argus-hardening-run.yml"
+    required: true
+  inputs_json:
+    description: "JSON object of inputs for that workflow. `marker` is added here."
+    required: false
+    default: '{}'
+  expect:
+    description: "Required conclusion: success, failure, or any"
+    required: true
+  test_id:
+    required: true
+  argus_ref:
+    description: >
+      argus ref to call. Injected into inputs_json as `argus_ref`, so every
+      dispatch target routes to its matching `uses:` job. Must be listed in
+      .github/data/argus-refs.json -- an unlisted ref matches no job in the
+      target, so every scan job would be skipped and the run would still
+      conclude 'success', reporting a pass for a ref nothing ran against.
+    required: false
+    default: 'main'
+  timeout_seconds:
+    required: false
+    default: '1800'
+
+outputs:
+  status:
+    value: ${{ steps.run.outputs.status }}
+  child_run_id:
+    value: ${{ steps.run.outputs.child_run_id }}
+  child_run_url:
+    value: ${{ steps.run.outputs.child_run_url }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        WF: ${{ inputs.workflow }}
+        INPUTS_JSON: ${{ inputs.inputs_json }}
+        EXPECT: ${{ inputs.expect }}
+        TEST_ID: ${{ inputs.test_id }}
+        TIMEOUT_S: ${{ inputs.timeout_seconds }}
+        ARGUS_REF: ${{ inputs.argus_ref }}
+      run: |
+        set -uo pipefail
+        fail() { echo "::error::$1"; echo "status=FAIL" >> "$GITHUB_OUTPUT"; exit 1; }
+
+        # Refuse an unenumerated ref before spending a run on it. See the
+        # identical guard in argus-scan for why a silent fallback to main is
+        # the exact failure this suite exists to catch.
+        REFS_FILE=".github/data/argus-refs.json"
+        if [ -f "$REFS_FILE" ]; then
+          if ! jq -r '.refs[].ref' "$REFS_FILE" | grep -Fxq "$ARGUS_REF"; then
+            fail "$TEST_ID: argus_ref '$ARGUS_REF' is not enumerated in $REFS_FILE. Add it there and add a matching job to every dispatch target."
+          fi
+        else
+          echo "::warning::$REFS_FILE not found (no checkout?) -- skipping the client-side ref check; the dispatch target still guards it."
+        fi
+
+        # The marker carries the BRANCH as well as the run id. reap-orphans
+        # cancels dispatched children that do not belong to the current run,
+        # and children live in one shared pool -- so without a branch component
+        # a suite run on one branch cancels the in-flight children of a run on
+        # another. That is the same failure that published a 62-of-88 board.
+        # Slashes are stripped: the marker is matched against a run-name.
+        BRANCH_SLUG="${GITHUB_REF_NAME//\//-}"
+        MARKER="${TEST_ID}-${BRANCH_SLUG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        echo "marker: $MARKER   workflow: $WF   argus_ref: $ARGUS_REF"
+
+        echo "$INPUTS_JSON" | jq -e . >/dev/null 2>&1 || fail "inputs_json is not valid JSON: $INPUTS_JSON"
+
+        # `gh workflow run --json` demands STRING values for every input, even
+        # ones the workflow declares as boolean -- it rejects a real JSON bool
+        # with "cannot unmarshal bool into Go value of type string". Coerce
+        # here so no caller has to remember it.
+        echo "$INPUTS_JSON" \
+          | jq -c --arg m "$MARKER" --arg r "$ARGUS_REF" \
+              '. + {marker: $m, argus_ref: $r} | with_entries(.value |= tostring)' \
+          > /tmp/dispatch-inputs.json
+        cat /tmp/dispatch-inputs.json
+
+        # THE API BUDGET. github.token allows 1,000 REST requests per hour per
+        # repository, shared by every job in the run. ~40 of these run at once;
+        # at the old cadence (a lookup every 5s, then a status poll every 15s)
+        # one suite run made ~4,000 calls, the budget ran out part way, and every
+        # poll after that failed silently -- `2>/dev/null || echo unknown` -- so
+        # child runs that SUCCEEDED were reported as "did not finish" (runs
+        # 35913556488 and 36006548670: 12 and 26 tests, all of them this).
+        #
+        # So: poll every ~100s, and when ANY call is refused -- the dispatch
+        # itself included -- ask when the budget resets (GET /rate_limit does not
+        # count against it), wait for that, and add the wait to the deadline: a
+        # throttle is not the child taking too long. The budget is per hour and
+        # shared by overlapping runs, so a run that starts while a cancelled one
+        # is still spending it (36022839257: C5 and R7 could not even dispatch)
+        # has to be able to wait rather than fail.
+        throttle_wait() {
+          local reset now wait
+          reset=$(gh api rate_limit --jq '.resources.core | select(.remaining == 0) | .reset' 2>/dev/null || true)
+          [ -n "$reset" ] || return 1
+          now=$(date +%s); wait=$(( reset - now + 5 ))
+          [ "$wait" -gt 0 ] || return 1
+          [ "$wait" -gt 1200 ] && wait=1200
+          echo "::notice::API budget for this repository is spent; waiting ${wait}s for it to reset."
+          sleep "$wait"
+          THROTTLED=$(( ${THROTTLED:-0} + wait ))
+          return 0
+        }
+
+        # Retried, because a single attempt turns a throttle into a red test
+        # that reads as an argus regression. A refused call waits for the
+        # budget to reset first instead of burning the next attempt seconds later.
+        DISPATCHED=false
+        for attempt in 1 2 3 4 5; do
+          if gh workflow run "$WF" --ref "$GITHUB_REF_NAME" --json < /tmp/dispatch-inputs.json 2>/tmp/dispatch-err; then
+            DISPATCHED=true
+            break
+          fi
+          echo "::warning::dispatch attempt $attempt failed: $(tr '\n' ' ' < /tmp/dispatch-err | cut -c1-400)"
+          throttle_wait || sleep $(( attempt * 15 + RANDOM % 10 ))
+        done
+        if [ "$DISPATCHED" != "true" ]; then
+          fail "Could not dispatch $WF after 5 attempts. Last error from gh: $(tr '\n' ' ' < /tmp/dispatch-err). Check that it exists on the DEFAULT branch, that this job has actions: write, and that every input value is a string."
+        fi
+
+        RID=""
+        for i in $(seq 1 30); do
+          sleep 10
+          RID=$(gh run list --workflow="$WF" --limit 100 --json databaseId,displayTitle \
+                --jq "[.[] | select(.displayTitle == \"argus $MARKER\")][0].databaseId" 2>/tmp/lookup-err || true)
+          if [ -n "$RID" ] && [ "$RID" != "null" ]; then break; fi
+          if [ -s /tmp/lookup-err ]; then throttle_wait || true; fi
+          RID=""
+        done
+        [ -n "$RID" ] || fail "Dispatched $WF but no run named 'argus $MARKER' appeared within 300s."
+
+        URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/$RID"
+        echo "child_run_id=$RID" >> "$GITHUB_OUTPUT"
+        echo "child_run_url=$URL" >> "$GITHUB_OUTPUT"
+        echo "argus run: $URL"
+
+        DEADLINE=$(( $(date +%s) + TIMEOUT_S ))
+        STATUS=""; CONCL=""; SEEN=false; LASTERR=""
+        # A child takes minutes: the first look is after ~60s, then every ~100s
+        # with jitter so ~40 pollers do not fire together.
+        sleep 60
+        while [ "$(date +%s)" -lt "$(( DEADLINE + ${THROTTLED:-0} ))" ]; do
+          if OUT=$(gh run view "$RID" --json status,conclusion \
+                     --jq '"\(.status) \(.conclusion // "-")"' 2>/tmp/poll-err); then
+            read -r STATUS CONCL <<<"$OUT"; SEEN=true
+            [ "$STATUS" = "completed" ] && break
+          else
+            LASTERR=$(tr '\n' ' ' < /tmp/poll-err | cut -c1-300)
+            if throttle_wait; then continue; fi
+          fi
+          sleep $(( 90 + RANDOM % 20 ))
+        done
+        if [ "$STATUS" != "completed" ]; then
+          # Never having seen the child is a different failure from watching it
+          # overrun: say which, with gh's own error, instead of "last status: ".
+          if [ "$SEEN" != "true" ]; then
+            fail "Could not read the status of $URL at all (last error from gh: ${LASTERR:-none}). The child may well have finished; this job could not observe it."
+          fi
+          fail "$URL did not finish within ${TIMEOUT_S}s (last status: $STATUS)."
+        fi
+
+        echo "observed: $CONCL   expected: $EXPECT"
+        if [ "$EXPECT" = "any" ]; then
+          case "$CONCL" in
+            success|failure) echo "status=pass" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            *) fail "$TEST_ID: ended as '$CONCL', neither success nor failure -- $URL" ;;
+          esac
+        fi
+        if [ "$CONCL" = "$EXPECT" ]; then
+          echo "PASS $TEST_ID: concluded '$CONCL' as expected"
+          echo "status=pass" >> "$GITHUB_OUTPUT"
+        else
+          fail "$TEST_ID: concluded '$CONCL', expected '$EXPECT' -- $URL"
+        fi

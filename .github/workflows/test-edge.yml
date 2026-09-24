@@ -1,0 +1,280 @@
+name: "Edge & Adversarial Tests"
+
+on:
+  workflow_call:
+    inputs:
+      expected_failures:
+        description: 'JSON array of test ids from .github/data/expected-failures.json. A listed test still runs and still reports FAIL; its job just does not fail the run.'
+        required: false
+        type: string
+        default: '[]'
+      expected_labels:
+        description: 'JSON object mapping a known-failure test id to its upstream issue, shown in the job name.'
+        required: false
+        type: string
+        default: '{}'
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
+      max_parallel:
+        required: false
+        type: number
+        default: 4
+    outputs:
+      results:
+        description: "JSON array of individual test results"
+        value: ${{ jobs.validate-results.outputs.results }}
+
+permissions:
+  contents: read
+  actions: write        # dispatching argus-run.yml
+  security-events: write
+  packages: read
+  pull-requests: write
+
+# ============================================================================
+# Edge and adversarial coverage: matrix over a parameter table.
+#
+# E5, E6, E8 and E9 assert argus FAILS, so they are green when it does.
+#
+# E5 AND E9 WERE THE OPEN FINDINGS, AND ARE NOW FIXED UPSTREAM.
+# Both encoded argus reporting success having scanned nothing: an unrecognised
+# scanner name that matched no dispatch branch, and scan_mode=remote with an
+# empty image_ref that gated every scan job off. argus PR #427 adds a
+# `validate-inputs` job to container-scan.yml that refuses both before any scan
+# job starts. That job is pure bash in the workflow file itself, so it IS live
+# on a branch run -- unlike the Python half of the same PR, which stays pinned
+# at the released SDK (see audit-ref-liveness.sh). The expected-RED annotation
+# that used to live here has been removed along with the matching note in
+# failure-classes.json; if these go red again it is a regression, not a known
+# state.
+#
+# E6 PINS A CHOICE, AND THE CHOICE CHANGED. It passes `trivy,bogusscanner`:
+# one name argus knows, one it does not. It used to assert `success`, which
+# encoded "a typo is tolerated as long as something valid is left". PR #427's
+# validate_sub_scanners rejects the whole list if any member is unknown, so
+# this now asserts `failure`.
+#
+# The reasoning for accepting that, rather than arguing the list should run its
+# valid members: `scanners: trivy,tryvi` most likely means the author wanted
+# two scanners. Running one of them and reporting green attests to coverage
+# nobody verified, and the annotation that would carry the warning is exactly
+# the ::notice:: the same PR found people never read. Refusing costs one red
+# build and one obvious edit; tolerating costs a gate that silently covers half
+# of what its author believed. Fail-closed on a name the tool cannot honour is
+# the same rule E5 and E9 now enforce, and a suite that argued the opposite in
+# the neighbouring row would be incoherent.
+#
+# The alternative -- partial lists run their valid names and annotate loudly --
+# is defensible and belongs upstream as an argus issue, not as a silent flip
+# back here. Whoever reopens it should move this comment with the decision.
+#
+# Two entries carry deliberately hostile values and must stay exactly as
+# written: E3's scanner list has padding, mixed case and a repeat; E7's
+# container name has a slash and a space. Tidying either would delete the test.
+#
+# Two jobs are not matrix entries: E1a resolves a digest for E1 to pin, and E12
+# asserts on the CONTENT of E2's scan report, which now lives in the run E2
+# dispatched.
+# ============================================================================
+
+jobs:
+  e1-resolve-digest:
+    name: "E1a: resolve digest"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+    steps:
+      - name: Resolve nginx:1.19.0 to a digest
+        id: resolve
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -sSf \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/nginx:pull" \
+            | jq -r .token)
+
+          DIGEST=$(curl -sSf -I \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://registry-1.docker.io/v2/library/nginx/manifests/1.19.0" \
+            | tr -d '\r' \
+            | awk 'tolower($1) == "docker-content-digest:" {print $2}')
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Could not resolve a digest for nginx:1.19.0"
+            exit 1
+          fi
+
+          echo "Resolved nginx:1.19.0 -> $DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+  edge:
+    name: "${{ matrix.t.id }}: ${{ matrix.t.name }}${{ fromJSON(inputs.expected_labels || '{}')[matrix.t.id] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')[matrix.t.id]) || '' }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), matrix.t.id) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: e1-resolve-digest
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel || 3 }}
+      matrix:
+        t:
+          - { id: E1,  name: "digest-pinned image",        expect: success, image: "nginx@${{ needs.e1-resolve-digest.outputs.digest }}", cname: "e1-digest-pinned",    scanners: "trivy",              sev: none, user: "" }
+          - { id: E2,  name: "fully-qualified host",       expect: success, image: "docker.io/library/alpine:3.18",             cname: "e2-fq-alpine",        scanners: "trivy,grype",        sev: none, user: "" }
+          - { id: E3,  name: "messy scanners normalise",   expect: success, image: "gcr.io/distroless/static-debian12:latest",  cname: "e3-normalisation",    scanners: "trivy , TRIVY ,grype,  Trivy", sev: none, user: "" }
+          - { id: E5,  name: "no valid scanner (policy)",  expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e5-no-valid-scanner", scanners: "bogusscanner",       sev: none, user: "" }
+          - { id: E6,  name: "valid + typo'd scanner",     expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e6-partial-typo",     scanners: "trivy,bogusscanner", sev: none, user: "" }
+          # dry:allow E7's container_name IS the test -- a slash and a space in a
+          # value argus uses to build file and artifact names. The invocation
+          # matches E11's once cname is treated as cosmetic, which for every
+          # other row it is.
+          - { id: E7,  name: "container_name sanitisation", expect: success, image: "gcr.io/distroless/static-debian12:latest", cname: "Edge/Case Name",      scanners: "trivy",              sev: none, user: "" }
+          - { id: E8,  name: "auth without password",      expect: failure, image: "gcr.io/distroless/static-debian12:latest",  cname: "e8-auth-no-password", scanners: "trivy",              sev: none, user: "notarealuser" }
+          - { id: E9,  name: "empty image_ref (policy)",   expect: failure, image: "",                                         cname: "e9-empty-image-ref",  scanners: "trivy",              sev: none, user: "" }
+          - { id: E10, name: "packageless image",          expect: success, image: "hello-world:latest",                       cname: "e10-packageless",     scanners: "trivy,grype",        sev: low,  user: "" }
+          - { id: E11, name: "SARIF upload, zero findings", expect: success, image: "gcr.io/distroless/static-debian12:latest", cname: "e11-sarif-empty",     scanners: "trivy",              sev: none, user: "" }
+          - { id: E13, name: "foreign-architecture image", expect: success, image: "arm64v8/alpine:3.18",                       cname: "e13-arm64-alpine",    scanners: "trivy",              sev: none, user: "" }
+          - { id: E14, name: "SARIF upload at scale",      expect: success, image: "nginx:1.19.0",                             cname: "e14-sarif-scale",     scanners: "trivy,grype",        sev: none, user: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-scan
+        with:
+          test_id: ${{ matrix.t.id }}
+          expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
+          scan_mode: remote
+          image_ref: ${{ matrix.t.image }}
+          container_name: ${{ matrix.t.cname }}
+          registry_username: ${{ matrix.t.user }}
+          scanners: ${{ matrix.t.scanners }}
+          fail_on_severity: ${{ matrix.t.sev }}
+          allow_failure: 'false'
+      - name: Record result
+        if: always()
+        run: |
+          jq -n -c --arg id "${{ matrix.t.id }}" \
+                   --arg status "${{ steps.t.outputs.status || 'FAIL' }}" \
+                   --arg child "${{ steps.t.outputs.child_run_id }}" \
+                   '{id:$id, status:$status, child:$child}' > "result-${{ matrix.t.id }}.json"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testresult-${{ matrix.t.id }}
+          path: result-${{ matrix.t.id }}.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # E12: assert the scan actually ran against the requested image.
+  #
+  # E2's report lives in the run E2 dispatched, so this reads E2's result
+  # artifact for that child run id and pulls the report from it.
+  # --------------------------------------------------------------------------
+  e12-artifact-assertion:
+    name: "E12: scan artifact content"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: edge
+    if: always()
+    steps:
+      - name: Get E2's child run id
+        uses: actions/download-artifact@v4
+        with:
+          name: testresult-E2
+          path: ./e2-result
+
+      - name: Download E2's scan report from that child run
+        id: download
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          CHILD=$(jq -r '.child' ./e2-result/result-E2.json)
+          [ -n "$CHILD" ] && [ "$CHILD" != "null" ] || { echo "::error::E2 recorded no child run id"; exit 1; }
+          echo "E2 child run: $CHILD"
+          mkdir -p ./e2-summary
+          gh run download "$CHILD" -n scanner-summary-container-e2-fq-alpine -D ./e2-summary
+
+      - name: Assert the scan ran against the requested image
+        run: |
+          set -uo pipefail
+          STATUS="pass"
+          fail() { echo "::error::$1"; STATUS="FAIL"; }
+
+          if [ "${{ steps.download.outcome }}" != "success" ]; then
+            fail "E2 uploaded no scanner-summary-container-e2-fq-alpine artifact -- the scan produced no report"
+          else
+            REPORT=$(find ./e2-summary -type f -name '*.md' | head -n 1)
+            if [ -z "$REPORT" ] || [ ! -s "$REPORT" ]; then
+              fail "E2 artifact holds no readable markdown report"
+            else
+              echo "----- report -----"; head -40 "$REPORT"; echo "------------------"
+              # The fully-qualified ref must survive into the report, or the
+              # scan ran against something other than what was asked for.
+              if ! grep -qE 'alpine:3\.18' "$REPORT"; then
+                fail "E2's report never names alpine:3.18 -- the scan did not run against the requested image"
+              fi
+            fi
+          fi
+          [ "$STATUS" = "pass" ] || exit 1
+
+  validate-results:
+    name: "Validate Edge Test Results"
+    runs-on: ubuntu-latest
+    needs: [edge, e12-artifact-assertion]
+    if: always()
+    outputs:
+      results: ${{ steps.collect.outputs.results }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: testresult-E*
+          path: ./results
+          merge-multiple: true
+      - name: Build results JSON
+        id: collect
+        env:
+          E12: ${{ needs.e12-artifact-assertion.result }}
+        run: |
+          set -uo pipefail
+          cat > /tmp/detail.json <<'JSON'
+          {
+            "E1":  ["digest-pinned image","Does argus scan an image pinned by digest rather than tag?"],
+            "E2":  ["fully-qualified host","Does argus scan an image whose reference names the registry host explicitly?"],
+            "E3":  ["messy scanners list normalises","Does argus normalise a scanner list carrying padding, mixed case and a repeat?"],
+            "E5":  ["no valid scanner","Does argus fail when the scanners input names nothing it recognises?"],
+            "E6":  ["valid + typo'd scanner","Does argus refuse a scanner list when one name is valid and the other is a typo, rather than silently running only the valid one?"],
+            "E7":  ["container_name sanitisation","Does argus accept a container_name containing a slash and a space?"],
+            "E8":  ["auth without password","Does argus fail when a registry username is supplied with no password?"],
+            "E9":  ["empty image_ref","Does argus fail when scan_mode is remote and image_ref is empty?"],
+            "E10": ["packageless image","Does argus complete a scan of an image with no package manager database?"],
+            "E11": ["SARIF upload, zero findings","Does argus upload a SARIF report when the scan finds nothing?"],
+            "E12": ["scan artifact content","Does the scan report actually name the image that was requested?"],
+            "E13": ["foreign-architecture image","Does argus scan an arm64-only image from an amd64 runner?"],
+            "E14": ["SARIF upload at scale","Does argus upload a SARIF report for an image with hundreds of findings?"]
+          }
+          JSON
+          case "$E12" in
+            success) E12_STATUS=pass ;;
+            skipped) E12_STATUS=skip ;;
+            *)       E12_STATUS=FAIL ;;
+          esac
+          RESULTS=$(jq -s -c --slurpfile d /tmp/detail.json --arg e12 "$E12_STATUS" '
+            # Filter by id rather than trusting the artifact glob -- see remote.
+            ( [ .[] | select(.id | test("^E[0-9]+$")) | { id: .id, name: ($d[0][.id][0] // .id), detail: ($d[0][.id][1] // ""), status: .status } ]
+              + [ { id: "E12", name: $d[0]["E12"][0], detail: $d[0]["E12"][1], status: $e12 } ] )
+            | sort_by(.id | ltrimstr("E") | tonumber)
+          ' ./results/result-*.json)
+          echo "$RESULTS" | jq -e 'length > 0' >/dev/null || { echo "::error::no edge results collected"; exit 1; }
+          echo "collected $(echo "$RESULTS" | jq 'length') results"
+          echo "results=$RESULTS" >> "$GITHUB_OUTPUT"

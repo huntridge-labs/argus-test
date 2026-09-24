@@ -1,0 +1,48 @@
+name: "argus iac run (dispatch target)"
+run-name: "argus ${{ inputs.marker }}"
+
+# One job per enumerated argus ref -- see .github/data/argus-refs.json and the
+# header of argus-run.yml for why `uses:` cannot be parameterised.
+# infrastructure-scan.yml installs the SDK via setup-argus@<tag>, so a branch
+# run here tests branch YAML against the released SDK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      marker:    { required: true,  type: string }
+      argus_ref: { required: false, type: string, default: 'main' }
+      iac_path:  { required: false, type: string, default: '' }
+      fail_on_severity: { required: false, type: string, default: 'none' }
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: write
+
+jobs:
+  guard-ref:
+    name: "guard: argus_ref is enumerated"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          ARGUS_REF: ${{ inputs.argus_ref }}
+        run: |
+          set -euo pipefail
+          if ! jq -r '.refs[].ref' .github/data/argus-refs.json | grep -Fxq "$ARGUS_REF"; then
+            echo "::error title=Unenumerated argus_ref::'$ARGUS_REF' is not in .github/data/argus-refs.json, so no job here would run and this dispatch would still conclude 'success' over a scan that never happened."
+            exit 1
+          fi
+          echo "argus_ref '$ARGUS_REF' is enumerated."
+
+  scan-main:
+    name: "iac (argus@main)"
+    needs: guard-ref
+    if: inputs.argus_ref == 'main'
+    uses: huntridge-labs/argus/.github/workflows/infrastructure-scan.yml@main
+    with:
+      iac_path: ${{ inputs.iac_path }}
+      fail_on_severity: ${{ inputs.fail_on_severity }}
+

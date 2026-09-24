@@ -1,0 +1,232 @@
+name: "Run argus in its own run and assert the outcome"
+description: >
+  Dispatches argus-run.yml, waits for that run, and asserts its conclusion
+  against `expect`. Optionally asserts on the workflow_call outputs the child
+  published. The calling job is green exactly when every assertion holds, so a
+  test that asserts argus BLOCKS is green when argus blocks.
+
+inputs:
+  expect:
+    description: "Required conclusion: success, failure, or any (completed without crashing)"
+    required: true
+  test_id:
+    description: "Test id, e.g. R6 -- used to build a unique run marker"
+    required: true
+  argus_ref:
+    description: >
+      argus ref to scan with. Must be listed in .github/data/argus-refs.json --
+      an unlisted ref has no job in the dispatch target, so the scan would be
+      skipped and the run would still conclude 'success'. Refused here rather
+      than dispatched, so the error names the cause.
+    required: false
+    default: 'main'
+  scan_mode: { required: false, default: 'remote' }
+  image_ref: { required: false, default: '' }
+  container_name: { required: false, default: '' }
+  registry_username: { required: false, default: '' }
+  scanners: { required: false, default: 'trivy,grype,syft' }
+  fail_on_severity: { required: false, default: 'none' }
+  allow_failure: { required: false, default: 'false' }
+  search_paths: { required: false, default: '' }
+  platform: { required: false, default: '' }
+  fail_on_no_targets: { required: false, default: 'false' }
+  assert_outputs:
+    description: >
+      Optional jq filter applied to the child's scan-outputs.json. Must evaluate
+      truthy or the test fails. This is how a test asserts on container-scan.yml's
+      workflow_call outputs -- images_scanned, overall_status, the counts --
+      rather than only on the run's conclusion, which cannot tell "clean" from
+      "never ran". Example:
+        .outputs.overall_status != "success" and (.outputs.images_scanned|tonumber) == 1
+    required: false
+    default: ''
+  assert_outputs_optional:
+    description: >
+      When 'true', a ref that does not declare container-scan.yml's
+      workflow_call outputs downgrades assert_outputs to a warning instead of
+      failing. Only for tests whose PRIMARY assertion is the conclusion and
+      whose output check is an extra -- never for a test that exists to check
+      the outputs, which must fail loudly rather than quietly verify nothing.
+    required: false
+    default: 'false'
+  timeout_seconds: { required: false, default: '1800' }
+
+outputs:
+  status:
+    description: "pass or FAIL"
+    value: ${{ steps.run.outputs.status }}
+  child_run_url:
+    description: "URL of the argus run this dispatched"
+    value: ${{ steps.run.outputs.child_run_url }}
+  child_run_id:
+    description: "Run id of the argus run, for downloading its artifacts"
+    value: ${{ steps.run.outputs.child_run_id }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        # A composite action does not inherit the caller's env, and `gh` needs
+        # both: a token to authenticate, and the repo since there may be no
+        # checkout in the calling job.
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        ARGUS_REF: ${{ inputs.argus_ref }}
+        ASSERT_OUTPUTS: ${{ inputs.assert_outputs }}
+        ASSERT_OPTIONAL: ${{ inputs.assert_outputs_optional }}
+        TEST_ID: ${{ inputs.test_id }}
+        EXPECT: ${{ inputs.expect }}
+      run: |
+        set -uo pipefail
+
+        fail() { echo "::error::$1"; echo "status=FAIL" >> "$GITHUB_OUTPUT"; exit 1; }
+
+        # ---- refuse an unenumerated ref before spending a run on it --------
+        # The dispatch target selects its `uses:` job with `if:` on this value.
+        # An unlisted ref matches no job, so every scan job is skipped and the
+        # run still concludes 'success' -- a green tick over a ref nothing was
+        # tested against. The target carries the same guard; this one exists to
+        # fail in the test's own log, where the reader is looking.
+        REFS_FILE=".github/data/argus-refs.json"
+        if [ -f "$REFS_FILE" ]; then
+          if ! jq -r '.refs[].ref' "$REFS_FILE" | grep -Fxq "$ARGUS_REF"; then
+            fail "$TEST_ID: argus_ref '$ARGUS_REF' is not enumerated in $REFS_FILE. Add it there and add a matching job to every dispatch target, or the run would report a pass for a ref it never called."
+          fi
+        else
+          echo "::warning::$REFS_FILE not found (no checkout?) -- skipping the client-side ref check; the dispatch target still guards it."
+        fi
+
+        # The marker carries the BRANCH as well as the run id. reap-orphans
+        # cancels dispatched children that do not belong to the current run,
+        # and children live in one shared pool -- so without a branch component
+        # a suite run on one branch cancels the in-flight children of a run on
+        # another. That is the same failure that published a 62-of-88 board.
+        # Slashes are stripped: the marker is matched against a run-name.
+        BRANCH_SLUG="${GITHUB_REF_NAME//\//-}"
+        # Unique per test per attempt, so a re-run never matches an old child.
+        MARKER="${TEST_ID}-${BRANCH_SLUG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        echo "marker: $MARKER   argus_ref: $ARGUS_REF"
+
+        # RETRY, AND REPORT WHAT gh ACTUALLY SAID.
+        #
+        # The old message asserted a cause -- "it must exist on the default
+        # branch, and the job needs actions: write" -- and discarded gh's
+        # stderr. argus-dispatch was fixed for exactly this months ago and this
+        # copy was missed, so when 48 dispatches failed at once the log said
+        # nothing about why. Never assert a cause you did not read.
+        #
+        # The retry is not decoration. Two suite runs on different branches
+        # fire ~80 workflow_dispatch calls in a few minutes, and GitHub's
+        # secondary rate limit rejects the excess. A single attempt turns a
+        # throttle into 48 red tests that look like argus regressions.
+        DISPATCHED=false
+        for attempt in 1 2 3 4 5; do
+          if gh workflow run argus-run.yml --ref "$GITHUB_REF_NAME" \
+                -f marker="$MARKER" \
+                -f argus_ref="$ARGUS_REF" \
+                -f scan_mode='${{ inputs.scan_mode }}' \
+                -f image_ref='${{ inputs.image_ref }}' \
+                -f container_name='${{ inputs.container_name }}' \
+                -f registry_username='${{ inputs.registry_username }}' \
+                -f scanners='${{ inputs.scanners }}' \
+                -f fail_on_severity='${{ inputs.fail_on_severity }}' \
+                -f allow_failure='${{ inputs.allow_failure }}' \
+                -f search_paths='${{ inputs.search_paths }}' \
+                -f platform='${{ inputs.platform }}' \
+                -f fail_on_no_targets='${{ inputs.fail_on_no_targets }}' 2>/tmp/dispatch-err; then
+            DISPATCHED=true
+            break
+          fi
+          ERR=$(tr '\n' ' ' < /tmp/dispatch-err | cut -c1-400)
+          echo "::warning::dispatch attempt $attempt failed: $ERR"
+          # Backoff with jitter, so a whole matrix does not retry in lockstep
+          # and reproduce the burst that caused the throttle.
+          sleep $(( attempt * 15 + RANDOM % 10 ))
+        done
+
+        if [ "$DISPATCHED" != "true" ]; then
+          fail "$TEST_ID: could not dispatch argus-run.yml after 5 attempts. Last error from gh: $(tr '\n' ' ' < /tmp/dispatch-err | cut -c1-400)"
+        fi
+
+        # The dispatch API returns no run id, so find the child by its run-name.
+        RID=""
+        for i in $(seq 1 60); do
+          sleep 5
+          RID=$(gh run list --workflow=argus-run.yml --limit 100 \
+                --json databaseId,displayTitle \
+                --jq "[.[] | select(.displayTitle == \"argus $MARKER\")][0].databaseId" 2>/dev/null || true)
+          if [ -n "$RID" ] && [ "$RID" != "null" ]; then break; fi
+          RID=""
+        done
+        [ -n "$RID" ] || fail "Dispatched argus-run.yml but no run named 'argus $MARKER' appeared within 300s."
+
+        URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/$RID"
+        echo "child_run_url=$URL" >> "$GITHUB_OUTPUT"
+        echo "child_run_id=$RID" >> "$GITHUB_OUTPUT"
+        echo "argus run: $URL"
+
+        # Wait for it to finish.
+        DEADLINE=$(( $(date +%s) + ${{ inputs.timeout_seconds }} ))
+        CONCL=""
+        while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+          read -r STATUS CONCL <<<"$(gh run view "$RID" --json status,conclusion \
+              --jq '"\(.status) \(.conclusion // "-")"' 2>/dev/null || echo "unknown -")"
+          [ "$STATUS" = "completed" ] && break
+          sleep 15
+        done
+        [ "$STATUS" = "completed" ] || fail "argus run $URL did not finish within ${{ inputs.timeout_seconds }}s (last status: $STATUS)."
+
+        echo "observed: $CONCL   expected: $EXPECT"
+
+        # ---- conclusion assertion ------------------------------------------
+        CONCLUSION_OK=false
+        # `any` is for tests whose point is that argus does not crash. It still
+        # rejects cancelled/skipped, so it cannot pass vacuously.
+        if [ "$EXPECT" = "any" ]; then
+          case "$CONCL" in
+            success|failure)
+              echo "PASS $TEST_ID: completed as '$CONCL' without crashing"
+              CONCLUSION_OK=true ;;
+            *) fail "$TEST_ID: argus run ended as '$CONCL', which is neither success nor failure -- $URL" ;;
+          esac
+        elif [ "$CONCL" = "$EXPECT" ]; then
+          echo "PASS $TEST_ID: argus run concluded '$CONCL' as expected"
+          CONCLUSION_OK=true
+        else
+          fail "$TEST_ID: argus run concluded '$CONCL', expected '$EXPECT' -- $URL"
+        fi
+
+        # ---- workflow_call output assertion --------------------------------
+        # Only runs when a test asked for one. Conclusion alone cannot separate
+        # "scanned and clean" from "scanned nothing"; these outputs can, which
+        # is the whole point of the nine that argus PR #427 adds.
+        if [ -n "$ASSERT_OUTPUTS" ]; then
+          rm -rf /tmp/child-outputs && mkdir -p /tmp/child-outputs
+          if ! gh run download "$RID" --name scan-outputs --dir /tmp/child-outputs 2>/tmp/dl-err; then
+            fail "$TEST_ID: asked to assert on scan outputs but the child published no 'scan-outputs' artifact ($(tr '\n' ' ' < /tmp/dl-err)). The publish-outputs job in argus-run.yml should always upload one -- $URL"
+          fi
+          OUTFILE=/tmp/child-outputs/scan-outputs.json
+          [ -f "$OUTFILE" ] || fail "$TEST_ID: scan-outputs artifact contained no scan-outputs.json -- $URL"
+          echo "--- child scan outputs ---"
+          jq . "$OUTFILE"
+
+          if [ "$(jq -r '.declared' "$OUTFILE")" != "true" ]; then
+            if [ "$ASSERT_OPTIONAL" = "true" ]; then
+              echo "::warning title=$TEST_ID output check skipped::argus@$ARGUS_REF does not declare container-scan.yml workflow_call outputs, so '$ASSERT_OUTPUTS' was not evaluated. The conclusion assertion above still ran and is what this test primarily checks."
+              echo "status=pass" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            fail "$TEST_ID: argus@$ARGUS_REF does not declare container-scan.yml workflow_call outputs, so '$ASSERT_OUTPUTS' cannot be evaluated. This assertion needs a ref carrying argus PR #427 -- $URL"
+          fi
+
+          if ! jq -e "$ASSERT_OUTPUTS" "$OUTFILE" >/dev/null 2>&1; then
+            fail "$TEST_ID: output assertion failed. Filter: $ASSERT_OUTPUTS -- against $(jq -c '.outputs' "$OUTFILE") -- $URL"
+          fi
+          echo "PASS $TEST_ID: output assertion held -- $ASSERT_OUTPUTS"
+        fi
+
+        if [ "$CONCLUSION_OK" = "true" ]; then
+          echo "status=pass" >> "$GITHUB_OUTPUT"
+        fi

@@ -1,0 +1,49 @@
+name: "argus config run (dispatch target)"
+run-name: "argus ${{ inputs.marker }}"
+
+# One job per enumerated argus ref -- see .github/data/argus-refs.json and the
+# header of argus-run.yml for why `uses:` cannot be parameterised.
+# container-scan-from-config.yml pins parse-container-config, security-summary
+# and setup-argus at their release tags, so a branch run here exercises almost
+# nothing new on the Python side.
+
+on:
+  workflow_dispatch:
+    inputs:
+      marker:      { required: true,  type: string }
+      argus_ref:   { required: false, type: string, default: 'main' }
+      config_file: { required: true,  type: string }
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: write
+  id-token: write
+  packages: read
+
+jobs:
+  guard-ref:
+    name: "guard: argus_ref is enumerated"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          ARGUS_REF: ${{ inputs.argus_ref }}
+        run: |
+          set -euo pipefail
+          if ! jq -r '.refs[].ref' .github/data/argus-refs.json | grep -Fxq "$ARGUS_REF"; then
+            echo "::error title=Unenumerated argus_ref::'$ARGUS_REF' is not in .github/data/argus-refs.json, so no job here would run and this dispatch would still conclude 'success' over a scan that never happened."
+            exit 1
+          fi
+          echo "argus_ref '$ARGUS_REF' is enumerated."
+
+  scan-main:
+    name: "config (argus@main)"
+    needs: guard-ref
+    if: inputs.argus_ref == 'main'
+    uses: huntridge-labs/argus/.github/workflows/container-scan-from-config.yml@main
+    with:
+      config_file: ${{ inputs.config_file }}
+

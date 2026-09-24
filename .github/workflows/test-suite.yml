@@ -2,7 +2,10 @@ name: "Argus Test Suite"
 
 on:
   push:
-    branches: [main]
+    # Every branch that carries work worth assessing. Not '**': the suite
+    # dispatches ~95 jobs plus child argus runs, so a scratch branch pushed
+    # twice a minute would swamp the runner pool and the dispatch targets.
+    branches: [main, dev, 'feat/**', 'fix/**']
 
   workflow_dispatch:
     inputs:
@@ -17,11 +20,14 @@ on:
           - discover
           - actions
           - combination
+          - edge
+          - workflows
+          - runtime-env
           - regression
           - scn
         default: 'all'
       argus_ref:
-        description: 'Argus branch/tag to test (default: main). Unit + action tests use this ref; reusable workflow tests always use @main.'
+        description: 'Argus branch/tag to test. Must be listed in .github/data/argus-refs.json. NOTE: on a branch, only the workflow YAML is live -- nested actions and the SDK stay pinned at their release tag. The Ref liveness job reports the split and the dashboard shows it.'
         required: false
         type: string
         default: 'main'
@@ -30,14 +36,27 @@ on:
     # Weekly Sunday 9am UTC
     - cron: '0 9 * * 0'
 
+# Per-ref, so a push supersedes only its own branch's run.
 concurrency:
   group: test-suite-${{ github.ref }}
   cancel-in-progress: true
 
+# NOTE ON CONCURRENT BRANCHES. Each run fires roughly forty workflow_dispatch
+# calls and then polls for each child. Two branches running at once produced
+# ~80 dispatches in a few minutes and GitHub's secondary rate limit rejected
+# most of them: 48 tests went red with "Could not dispatch", which reads as an
+# argus regression and is not one. The dispatch actions retry with jittered
+# backoff now, and max-parallel is lowered below, but the honest position is
+# that this suite is heavy on the Actions API and two simultaneous full runs
+# are close to its ceiling.
+
 permissions:
   contents: read
   security-events: write
-  actions: read
+  # write, not read: the converted suites dispatch argus-run.yml. A called
+  # workflow cannot request more than its caller grants, and asking for more
+  # fails the whole run at startup with no jobs and no annotation.
+  actions: write
   packages: read
   pull-requests: write
   checks: write
@@ -51,9 +70,79 @@ permissions:
 # ============================================================================
 
 jobs:
+  # --------------------------------------------------------------------------
+  # Cancel argus-run children orphaned by a superseded parent.
+  #
+  # A dispatched run is independent: cancelling or superseding the run that
+  # dispatched it leaves it queued. With cancel-in-progress on this workflow,
+  # every push during a run strands that run's children, and they crowd the
+  # queue ahead of the live ones -- 20 orphans accumulated over four pushes
+  # while proving this out.
+  #
+  # Matches on the marker each child carries in its run-name, keeping only
+  # those belonging to THIS run.
+  # --------------------------------------------------------------------------
+  reap-orphans:
+    name: "Reap orphaned argus runs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # Only THIS BRANCH's strays. Dispatched children share one pool, so
+          # the previous filter -- "anything not carrying my run id" -- reaped
+          # the live children of every other branch's suite run too. The
+          # parent-level concurrency group is per-ref and correctly isolates
+          # parents; the children were not isolated at all, which made
+          # concurrent branches cancel each other and publish partial boards.
+          BRANCH_SLUG="${GITHUB_REF_NAME//\//-}"
+          echo "reaping strays for branch slug '$BRANCH_SLUG' only"
+          N=0
+          for WF in argus-run.yml argus-hardening-run.yml argus-iac-run.yml argus-config-run.yml; do
+          for r in $(gh run list --workflow="$WF" --limit 100 \
+                     --json databaseId,status,displayTitle \
+                     --jq ".[] | select(.status==\"queued\" or .status==\"in_progress\")
+                           | select(.displayTitle | contains(\"-${BRANCH_SLUG}-\"))
+                           | select(.displayTitle | contains(\"-${GITHUB_RUN_ID}-\") | not)
+                           | .databaseId" 2>/dev/null); do
+            gh run cancel "$r" >/dev/null 2>&1 && N=$((N+1))
+          done
+          done
+          echo "cancelled $N orphaned argus run(s) from superseded runs on this branch"
+
   # ==========================================================================
   # Unit Tests (U1-U5)
   # ==========================================================================
+  # ==========================================================================
+  # Known argus failures (.github/data/expected-failures.json). Read once and
+  # handed to the suites -- a listed test's job may fail without failing the run
+  # -- and to the summary, which goes red on a NEW failure or on a listed test
+  # that starts passing. Never fails itself: every suite depends on it.
+  # ==========================================================================
+  expected-failures:
+    name: "Load expected failures"
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      ids: ${{ steps.load.outputs.ids }}
+      labels: ${{ steps.load.outputs.labels }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/data
+      - id: load
+        run: |
+          IDS=$(jq -c '[.expected[].id]' .github/data/expected-failures.json 2>/dev/null) || IDS='[]'
+          # id -> issue, e.g. {"N5":"huntridge-labs/argus#436"}
+          LABELS=$(jq -c '[.expected[] | {(.id): .issue}] | add // {}' .github/data/expected-failures.json 2>/dev/null) || LABELS='{}'
+          echo "ids=${IDS:-[]}" >> "$GITHUB_OUTPUT"
+          [ -n "$LABELS" ] || LABELS='{}'
+          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
+          echo "Known argus failures: $LABELS"
+
   unit-tests:
     name: "Unit Tests"
     if: inputs.scope == 'all' || inputs.scope == 'unit' || github.event_name == 'schedule' || github.event_name == 'push'
@@ -77,7 +166,12 @@ jobs:
   remote-tests:
     name: "Remote Mode Tests"
     if: inputs.scope == 'all' || inputs.scope == 'remote' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-remote.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Discover Mode Tests (D1-D3)
@@ -85,7 +179,31 @@ jobs:
   discover-tests:
     name: "Discover Mode Tests"
     if: inputs.scope == 'all' || inputs.scope == 'discover' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-discover.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
+
+  # ==========================================================================
+  # Runtime Environment Tests (N1-N5)
+  #
+  # SDK-direct, not dispatched. These depend on what the host has and on which
+  # image variant argus chose, neither of which survives the dispatch path: a
+  # dispatched run installs the SDK from setup-argus@<tag>, so it would test the
+  # released Python no matter what argus_ref says. These check argus out at the
+  # ref instead, which is also the only place the raw exit code is visible.
+  # ==========================================================================
+  runtime-env-tests:
+    name: "Runtime Environment Tests"
+    if: inputs.scope == 'all' || inputs.scope == 'runtime-env' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: expected-failures
+    uses: ./.github/workflows/test-runtime-env.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
   # Combination / Pairwise Tests (C1-C15)
@@ -93,25 +211,77 @@ jobs:
   combination-tests:
     name: "Combination Tests"
     if: inputs.scope == 'all' || inputs.scope == 'combination' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: [reap-orphans, expected-failures]
     uses: ./.github/workflows/test-combination.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
 
   # ==========================================================================
-  # SCN Detector Tests (S1-S25) — on-demand only (scope=scn)
+  # Edge & Adversarial Tests (E1-E12)
+  # ==========================================================================
+  edge-tests:
+    name: "Edge & Adversarial Tests"
+    if: inputs.scope == 'all' || inputs.scope == 'edge' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: [reap-orphans, expected-failures]
+    uses: ./.github/workflows/test-edge.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
+
+  # ==========================================================================
+  # Top-level Workflow Tests (W1-W4)
+  # ==========================================================================
+  workflow-tests:
+    name: "Top-level Workflow Tests"
+    if: inputs.scope == 'all' || inputs.scope == 'workflows' || github.event_name == 'schedule' || github.event_name == 'push'
+    needs: [reap-orphans, expected-failures]
+    uses: ./.github/workflows/test-workflows.yml
+    with:
+      argus_ref: ${{ inputs.argus_ref || 'main' }}
+      expected_failures: ${{ needs.expected-failures.outputs.ids || '[]' }}
+      expected_labels: ${{ needs.expected-failures.outputs.labels || '{}' }}
+
+  # ==========================================================================
+  # SCN Detector Tests (S1-S25)
+  #
+  # Previously gated on `inputs.scope == 'scn'`, which excluded them from `all`,
+  # from push and from the weekly schedule -- so 25 of 81 tests (31% of the
+  # suite) only ever ran if somebody remembered to dispatch them by hand, and a
+  # detector regression could sit unnoticed indefinitely. 24 of the 25 need
+  # nothing but GITHUB_TOKEN; only S25 reaches an external API, and it now skips
+  # itself when the key is absent. They run with everything else.
   # ==========================================================================
   scn-tests:
     name: "SCN Detector Tests"
-    if: inputs.scope == 'scn'
+    if: inputs.scope == 'all' || inputs.scope == 'scn' || github.event_name == 'schedule' || github.event_name == 'push'
     uses: ./.github/workflows/test-scn-detector.yml
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   # ==========================================================================
-  # I1: Infrastructure scan regression
+  # I5: Infrastructure scan regression
   # ==========================================================================
-  i1-infrastructure-scan:
-    name: "I1: infrastructure-scan regression"
+  i5-infrastructure-scan:
+    name: "I5: infrastructure-scan regression"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: reap-orphans
     if: inputs.scope == 'all' || inputs.scope == 'regression' || github.event_name == 'schedule' || github.event_name == 'push'
-    uses: huntridge-labs/argus/.github/workflows/infrastructure-scan.yml@main
-    with:
-      fail_on_severity: none
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-dispatch
+        with:
+          test_id: I5
+          expect: success
+          workflow: argus-iac-run.yml
+          # iac_path was the default "infrastructure", which does not exist here,
+          # so I1 passed by scanning nothing. tests/iac holds deliberately
+          # insecure Terraform for the scanners to actually parse.
+          inputs_json: '{"iac_path":"tests/iac","fail_on_severity":"none"}'
 
   # ==========================================================================
   # I2: No hardcoded URLs (inline regression check)
@@ -130,58 +300,213 @@ jobs:
 
       - name: Scan for hardcoded github.com in shell scripts
         run: |
-          echo "Scanning container-related action scripts for hardcoded github.com URLs..."
+          echo "Scanning action logic for hardcoded github.com URLs..."
 
-          VIOLATIONS=0
+          # Only executable content counts. The previous version grepped whole
+          # action.yml files, so a documentation link inside a `description:`
+          # block scalar -- prose a GHES user never executes -- was reported as
+          # a violation. Parse the YAML and look at `run:` bodies only.
+          python3 - <<'PYEOF'
+          import re, sys, pathlib, yaml
 
-          # Scan the container scanning composite actions
-          SCAN_DIRS=(
-            .github/actions/scanner-container
-            .github/actions/scanner-container-summary
-            .github/actions/parse-container-config
-          )
+          DIRS = ["scanner-container", "scanner-container-summary", "parse-container-config"]
+          URL = re.compile(r"https://github\.com")
+          ALLOWED = ("github.server_url", "GITHUB_SERVER_URL")
+          violations = []
 
-          for dir in "${SCAN_DIRS[@]}"; do
-            [ -d "$dir" ] || continue
+          def scan(path, text, label):
+              for i, line in enumerate(text.splitlines(), 1):
+                  if not URL.search(line):
+                      continue
+                  if line.lstrip().startswith("#") or any(a in line for a in ALLOWED):
+                      continue
+                  violations.append(f"{path}:{i} ({label}): {line.strip()}")
 
-            # Check .sh files (skip tests)
-            while IFS= read -r script; do
-              [[ "$script" == *"/tests/"* ]] && continue
-              MATCHES=$(grep -n 'https://github\.com' "$script" 2>/dev/null | grep -v '^\s*#' | grep -v 'github\.server_url' | grep -v 'GITHUB_SERVER_URL' || true)
-              if [ -n "$MATCHES" ]; then
-                echo "VIOLATION: $script"
-                echo "$MATCHES"
-                VIOLATIONS=$((VIOLATIONS + 1))
-              fi
-            done < <(find "$dir" -name "*.sh" -type f)
+          for d in DIRS:
+              base = pathlib.Path(".github/actions") / d
+              if not base.is_dir():
+                  continue
+              for f in base.rglob("*"):
+                  if not f.is_file() or "/tests/" in str(f) or "__pycache__" in str(f):
+                      continue
+                  if f.suffix in (".sh", ".py"):
+                      scan(str(f), f.read_text(errors="replace"), "script")
+                  elif f.name == "action.yml":
+                      try:
+                          doc = yaml.safe_load(f.read_text())
+                      except Exception as e:
+                          print(f"::warning::could not parse {f}: {e}")
+                          continue
+                      for step in ((doc or {}).get("runs", {}) or {}).get("steps", []) or []:
+                          body = step.get("run")
+                          if isinstance(body, str):
+                              scan(str(f), body, "run block of step %r" % (step.get("name") or "?"))
 
-            # Check action.yml
-            if [ -f "$dir/action.yml" ]; then
-              MATCHES=$(grep -n 'https://github\.com' "$dir/action.yml" 2>/dev/null | grep -v '^\s*#' | grep -v 'github\.server_url' | grep -v 'GITHUB_SERVER_URL' | grep -v 'description:' || true)
-              if [ -n "$MATCHES" ]; then
-                echo "VIOLATION: $dir/action.yml"
-                echo "$MATCHES"
-                VIOLATIONS=$((VIOLATIONS + 1))
-              fi
+          if violations:
+              print("Hardcoded github.com URLs in action logic:")
+              for v in violations:
+                  print("  " + v)
+              print(f"::error::Found {len(violations)} hardcoded github.com URL(s) in action logic")
+              sys.exit(1)
+          print("No hardcoded github.com URLs in action logic")
+          PYEOF
+  # ==========================================================================
+  # I1: the happy path.
+  #
+  # WHAT "HAPPY PATH" MEANS HERE. The ordinary, documented, first-thing-a-
+  # consumer-does use of argus, with nothing adversarial in it: point
+  # container-scan.yml at a clean image, run the default scanner set, and set a
+  # realistic severity gate. Everything configured the way the README tells a
+  # newcomer to configure it. The expected outcome is a green check over an
+  # image that was genuinely scanned and genuinely had nothing at or above the
+  # threshold.
+  #
+  # WHY IT IS WORTH A TEST OF ITS OWN, AND WHY IT IS I1. Every other test in
+  # this suite pins a specific edge, gate or failure mode; each one holds some
+  # input wrong on purpose. It is entirely possible for all of them to pass
+  # while the plain path a real consumer copies out of the README is broken --
+  # nothing else here asserts the whole ordinary sequence end to end. This is
+  # the smoke test, and it is numbered first because it is the one to read
+  # first: if I1 is red, argus does not work for its primary use case, whatever
+  # else is green.
+  #
+  # WHY IT DOES NOT ASSERT "GREEN" ALONE. A happy-path test that only checks
+  # the conclusion is the silent pass this suite exists to catch -- a scan that
+  # ran nothing at all also exits 0. So on refs that publish the workflow_call
+  # outputs it additionally requires images_scanned >= 1 and an overall_status
+  # of success: the gate passed AND something was actually examined. On older
+  # refs the output check is skipped with a warning rather than failing, since
+  # the conclusion assertion is still meaningful there.
+  #
+  # fail_on_severity is 'critical', not 'none'. A gate set to 'none' cannot
+  # fire, so it would prove only that the workflow ran; 'critical' is what a
+  # consumer would actually set. The CLEAN anchor has no package database, so
+  # the result is deterministic rather than drifting with upstream CVEs.
+  # ==========================================================================
+  i1-happy-path:
+    name: "I1: happy path"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: reap-orphans
+    if: inputs.scope == 'all' || inputs.scope == 'regression' || github.event_name == 'schedule' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-scan
+        with:
+          test_id: I1
+          expect: success
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
+          scan_mode: remote
+          image_ref: gcr.io/distroless/static-debian12:latest
+          container_name: i1-happy-path
+          scanners: trivy,grype,syft
+          fail_on_severity: critical
+          allow_failure: 'false'
+          assert_outputs_optional: 'true'
+          assert_outputs: >-
+            .outputs.overall_status == "success"
+            and (.outputs.images_scanned | tonumber) >= 1
+
+  # ==========================================================================
+  # I4: dispatch targets enumerate exactly the refs in argus-refs.json
+  #
+  # `uses:` cannot be an expression, so each target names its refs as literal
+  # jobs. If argus-refs.json lists a ref no target can run, a test pointed at it
+  # dispatches a run where every scan job is skipped -- and a run of nothing
+  # concludes 'success'. The guard jobs catch it at runtime; this catches it at
+  # review time, which is cheaper and does not need a green tick to be believed.
+  #
+  # This is a structural assertion, and the prompt-7 audit is explicitly
+  # suspicious of those. It earns its place because here the structure IS the
+  # contract: there is nothing to execute until a ref has a job.
+  # ==========================================================================
+  i4-dispatch-targets-cover-refs:
+    name: "I4: dispatch targets cover every enumerated ref"
+    if: inputs.scope == 'all' || inputs.scope == 'regression' || github.event_name == 'schedule' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every enumerated ref has a job in every target, and vice versa
+        run: |
+          set -uo pipefail
+          RC=0
+          REFS=$(jq -r '.refs[].ref' .github/data/argus-refs.json)
+          echo "Enumerated refs:"; echo "$REFS" | awk '{print "  " $0}'
+
+          for TARGET in $(jq -r '.targets[]' .github/data/argus-refs.json); do
+            F=".github/workflows/$TARGET"
+            if [ ! -f "$F" ]; then
+              echo "::error::argus-refs.json names target $TARGET but $F does not exist"
+              RC=1; continue
             fi
+            echo "--- $TARGET"
+
+            # Refs the file can actually call, taken from its `uses: ...@<ref>`
+            # lines rather than from its `if:` conditions -- the `uses:` pin is
+            # what decides which argus code runs.
+            PINS=$(grep -oE 'uses: huntridge-labs/argus/\.github/workflows/[^@]+@[^[:space:]]+' "$F" \
+                   | awk -F@ '{print $NF}' | sort -u)
+
+            while IFS= read -r ref; do
+              [ -z "$ref" ] && continue
+              if ! grep -Fxq "$ref" <<<"$PINS"; then
+                echo "::error::$TARGET has no job pinned to '$ref'. A test pointed at that ref would dispatch a run in which every scan job is skipped, and a run of nothing concludes success."
+                RC=1
+              else
+                echo "  ok: $ref"
+              fi
+            done <<<"$REFS"
+
+            while IFS= read -r pin; do
+              [ -z "$pin" ] && continue
+              if ! grep -Fxq "$pin" <<<"$REFS"; then
+                echo "::error::$TARGET can call argus@$pin but argus-refs.json does not list it, so argus-scan and the guard jobs will refuse it. Add it to argus-refs.json or remove the job."
+                RC=1
+              fi
+            done <<<"$PINS"
           done
+          [ "$RC" -eq 0 ] && echo "All dispatch targets match the ref enumeration."
+          exit "$RC"
 
-          if [ "$VIOLATIONS" -gt 0 ]; then
-            echo "::error::Found $VIOLATIONS file(s) with hardcoded github.com URLs"
-            exit 1
-          fi
-
-          echo "No hardcoded github.com URLs found in container scanning actions"
+  # ==========================================================================
+  # I6: no two matrix rows describe the same test
+  #
+  # A row identical to another once id and name are stripped is one test
+  # counted twice: it adds nothing and inflates the pass-rate denominator. PR
+  # #13 removed six by hand. A deliberate same-invocation pair is annotated
+  # with `# dry:allow <reason>` above the row. Like I4, this checks the suite
+  # rather than argus, and it fails closed: finding no rows at all is a failure.
+  # ==========================================================================
+  i6-no-duplicate-tests:
+    name: "I6: no duplicate test tuples"
+    if: inputs.scope == 'all' || inputs.scope == 'regression' || github.event_name == 'schedule' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: No two matrix rows are the same test
+        run: python3 .github/scripts/check-duplicate-tuples.py .github/workflows
 
   # ==========================================================================
   # I3: Config-driven container scan regression
   # ==========================================================================
   i3-config-scan:
     name: "I3: config-driven scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: reap-orphans
     if: inputs.scope == 'all' || inputs.scope == 'regression' || github.event_name == 'schedule' || github.event_name == 'push'
-    uses: huntridge-labs/argus/.github/workflows/container-scan-from-config.yml@main
-    with:
-      config_file: tests/configs/single-public.yml
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-dispatch
+        with:
+          test_id: I3
+          expect: success
+          workflow: argus-config-run.yml
+          inputs_json: '{"config_file":"tests/configs/single-public.yml"}'
 
   # ==========================================================================
   # Final Summary
@@ -189,21 +514,66 @@ jobs:
   summary:
     name: "Test Suite Summary"
     runs-on: ubuntu-latest
+    outputs:
+      # $GITHUB_ENV does not cross jobs, so `publish` reads the artifact name here
+      dashboard_artifact: dashboard-${{ steps.branch.outputs.slug }}
+      # False when any suite was cancelled, so `publish` can refuse a partial
+      # board. Failed is fine and still publishes; cancelled is not.
+      run_complete: ${{ steps.completeness.outputs.complete }}
     needs:
       - unit-tests
       - action-tests
       - remote-tests
       - discover-tests
       - combination-tests
+      - edge-tests
+      - workflow-tests
       - scn-tests
-      - i1-infrastructure-scan
+      - i5-infrastructure-scan
       - i2-no-hardcoded-urls
       - i3-config-scan
+      - i1-happy-path
+      - i4-dispatch-targets-cover-refs
+      - i6-no-duplicate-tests
+      - runtime-env-tests
+      - expected-failures
     if: always()
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    # No `environment:` here. The github-pages environment restricts deployment
+    # to main, and an environment gate rejects the job before any step runs --
+    # so with it, this job died in 2s on every non-main branch and the dashboard
+    # was never generated there at all. Publishing now lives in `publish` below.
     steps:
+      # Cancelled is not failed. A failing suite publishes -- that is the point
+      # of the board. A cancelled one has no verdict to report.
+      - name: Was this run actually completed?
+        id: completeness
+        env:
+          R1: ${{ needs.unit-tests.result }}
+          R2: ${{ needs.action-tests.result }}
+          R3: ${{ needs.runtime-env-tests.result }}
+          R4: ${{ needs.remote-tests.result }}
+          R5: ${{ needs.discover-tests.result }}
+          R6: ${{ needs.combination-tests.result }}
+          R7: ${{ needs.edge-tests.result }}
+          R8: ${{ needs.workflow-tests.result }}
+          R9: ${{ needs.scn-tests.result }}
+          R10: ${{ needs.i1-happy-path.result }}
+          R11: ${{ needs.i2-no-hardcoded-urls.result }}
+          R12: ${{ needs.i3-config-scan.result }}
+          R13: ${{ needs.i4-dispatch-targets-cover-refs.result }}
+          R14: ${{ needs.i5-infrastructure-scan.result }}
+          R15: ${{ needs.i6-no-duplicate-tests.result }}
+        run: |
+          set -uo pipefail
+          ALL="$R1 $R2 $R3 $R4 $R5 $R6 $R7 $R8 $R9 $R10 $R11 $R12 $R13 $R14 $R15"
+          echo "category results: $ALL"
+          if printf '%s' "$ALL" | grep -qw "cancelled"; then
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Partial run, not published::At least one suite was cancelled, so this run has no complete verdict. The dashboard is still generated and uploaded as an artifact, but it will not overwrite the published board -- a partial board reads as though tests were skipped rather than stopped."
+          else
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Generate consolidated summary
         env:
           UNIT_JSON: ${{ needs.unit-tests.outputs.results }}
@@ -211,18 +581,29 @@ jobs:
           REMOTE_JSON: ${{ needs.remote-tests.outputs.results }}
           DISCOVER_JSON: ${{ needs.discover-tests.outputs.results }}
           COMBO_JSON: ${{ needs.combination-tests.outputs.results }}
+          EDGE_JSON: ${{ needs.edge-tests.outputs.results }}
+          WF_JSON: ${{ needs.workflow-tests.outputs.results }}
           SCN_JSON: ${{ needs.scn-tests.outputs.results }}
+          RUNTIME_JSON: ${{ needs.runtime-env-tests.outputs.results }}
           UNIT_RESULT: ${{ needs.unit-tests.result }}
           ACTIONS_RESULT: ${{ needs.action-tests.result }}
           REMOTE_RESULT: ${{ needs.remote-tests.result }}
           DISCOVER_RESULT: ${{ needs.discover-tests.result }}
           COMBO_RESULT: ${{ needs.combination-tests.result }}
+          EDGE_RESULT: ${{ needs.edge-tests.result }}
+          WF_RESULT: ${{ needs.workflow-tests.result }}
           SCN_RESULT: ${{ needs.scn-tests.result }}
-          I1: ${{ needs.i1-infrastructure-scan.result }}
+          RUNTIME_RESULT: ${{ needs.runtime-env-tests.result }}
+          I1: ${{ needs.i1-happy-path.result }}
           I2: ${{ needs.i2-no-hardcoded-urls.result }}
           I3: ${{ needs.i3-config-scan.result }}
+          I4: ${{ needs.i4-dispatch-targets-cover-refs.result }}
+          I5: ${{ needs.i5-infrastructure-scan.result }}
+          I6: ${{ needs.i6-no-duplicate-tests.result }}
           SCOPE: ${{ inputs.scope || 'all' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          XF: ${{ needs.expected-failures.outputs.ids || '[]' }}
+          XF_LABELS: ${{ needs.expected-failures.outputs.labels || '{}' }}
         run: |
           icon() {
             case "$1" in
@@ -258,20 +639,32 @@ jobs:
           REMOTE_ARR=$(safe_json "$REMOTE_JSON")
           DISCOVER_ARR=$(safe_json "$DISCOVER_JSON")
           COMBO_ARR=$(safe_json "$COMBO_JSON")
+          EDGE_ARR=$(safe_json "$EDGE_JSON")
+          WF_ARR=$(safe_json "$WF_JSON")
           SCN_ARR=$(safe_json "$SCN_JSON")
+          RUNTIME_ARR=$(safe_json "$RUNTIME_JSON")
 
           # Build I1 and I2 inline (they're standalone jobs, not sub-workflows)
           I1_STATUS=$(to_status "$I1")
           I2_STATUS=$(to_status "$I2")
           I3_STATUS=$(to_status "$I3")
+          I4_STATUS=$(to_status "$I4")
+          I5_STATUS=$(to_status "$I5")
+          I6_STATUS=$(to_status "$I6")
           REGRESSION_ARR=$(jq -n -c \
             --arg i1 "$I1_STATUS" \
             --arg i2 "$I2_STATUS" \
             --arg i3 "$I3_STATUS" \
+            --arg i4 "$I4_STATUS" \
+            --arg i5 "$I5_STATUS" \
+            --arg i6 "$I6_STATUS" \
             '[
-              {"id":"I1","name":"infrastructure-scan regression","detail":"infrastructure-scan.yml reusable workflow still works","status":$i1},
-              {"id":"I2","name":"no hardcoded URLs","detail":"No hardcoded github.com in container action scripts","status":$i2},
-              {"id":"I3","name":"config-driven scan","detail":"container-scan-from-config.yml reusable workflow still works","status":$i3}
+              {"id":"I1","name":"happy path","detail":"Does argus work for a happy path workflow? The ordinary documented use with nothing adversarial in it: a clean image, the default scanner set and a realistic severity gate. Green only counts if an image was actually scanned, so it also requires images_scanned of at least 1 and an overall_status of success.","status":$i1},
+              {"id":"I2","name":"no hardcoded URLs","detail":"Are the container action shell scripts still free of hardcoded github.com URLs?","status":$i2},
+              {"id":"I3","name":"config-driven scan","detail":"Does the container-scan-from-config reusable workflow still scan the containers named in a config file?","status":$i3},
+              {"id":"I4","name":"dispatch targets cover every ref","detail":"Does every argus ref this suite can be pointed at have a matching job in all four dispatch targets, so a run cannot report a pass for a ref nothing called?","status":$i4},
+              {"id":"I5","name":"infrastructure-scan regression","detail":"Does the infrastructure-scan reusable workflow still complete a trivy-iac and checkov run?","status":$i5},
+              {"id":"I6","name":"no duplicate test tuples","detail":"Is every matrix row a distinct test, so none is counted twice in the pass rate? Rows identical once id and name are removed fail unless annotated with a dry:allow reason.","status":$i6}
             ]')
 
           # Merge all into one array
@@ -281,9 +674,12 @@ jobs:
             --argjson r "$REMOTE_ARR" \
             --argjson d "$DISCOVER_ARR" \
             --argjson c "$COMBO_ARR" \
+            --argjson e "$EDGE_ARR" \
+            --argjson w "$WF_ARR" \
             --argjson s "$SCN_ARR" \
+            --argjson n "$RUNTIME_ARR" \
             --argjson i "$REGRESSION_ARR" \
-            '$u + $a + $r + $d + $c + $s + $i')
+            '$u + $a + $r + $d + $c + $e + $w + $s + $n + $i')
 
           # Export for dashboard generation step
           {
@@ -299,15 +695,48 @@ jobs:
           PASSED=$(echo "$ALL" | jq '[.[] | select(.status == "pass")] | length')
           FAILED=$(echo "$ALL" | jq '[.[] | select(.status == "FAIL")] | length')
           SKIPPED=$(echo "$ALL" | jq '[.[] | select(.status == "skip" or .status == "cancel")] | length')
-          RUNNABLE=$((TOTAL - SKIPPED))
-          [ "$RUNNABLE" -eq 0 ] && RUNNABLE=1
-          PASS_RATE=$((PASSED * 100 / RUNNABLE))
+          # The board's pass rate: passed / every test reported, rounded down.
+          # (This line used to exclude skips, so it disagreed with the board.)
+          PASS_RATE=$(( TOTAL > 0 ? PASSED * 100 / TOTAL : 0 ))
 
-          if [ "$FAILED" -eq 0 ] && [ "$PASSED" -gt 0 ]; then
-            VERDICT=":white_check_mark: **PASS**"
+          # THE VERDICT, computed once. The gate step below reads it from
+          # GITHUB_ENV instead of re-deriving it, so the run page can never say
+          # FAIL over a green run again. Red is what CHANGED: a failure not in
+          # expected-failures.json, a listed test that passes (argus fixed it),
+          # a category that failed without reporting a failing test, or nothing
+          # passing at all. A listed failure is a known argus bug: shown, not red.
+          jq -e 'type == "array"' <<<"$XF" >/dev/null 2>&1 || XF='[]'
+          jq -e 'type == "object"' <<<"$XF_LABELS" >/dev/null 2>&1 || XF_LABELS='{}'
+          V_NEW=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] - $xf | join(" ")' <<<"$ALL")
+          V_FIXED=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "pass") | .id] as $p | [$xf[] | select(. as $i | $p | index($i))] | join(" ")' <<<"$ALL")
+          V_KNOWN=$(jq -r --argjson xf "$XF" '[.[] | select(.status == "FAIL") | .id] as $f | [$xf[] | select(. as $i | $f | index($i))] | join(" ")' <<<"$ALL")
+          V_CATS=0
+          for r in "$UNIT_RESULT" "$ACTIONS_RESULT" "$REMOTE_RESULT" "$DISCOVER_RESULT" "$COMBO_RESULT" "$EDGE_RESULT" "$WF_RESULT" "$SCN_RESULT" "$RUNTIME_RESULT" "$I1" "$I2" "$I3" "$I4" "$I5" "$I6"; do
+            [ "$r" = "failure" ] && V_CATS=$((V_CATS + 1))
+          done
+          V_BROKE=0; [ -z "$V_NEW" ] && V_BROKE=$V_CATS
+          if [ -n "$V_NEW" ] || [ -n "$V_FIXED" ] || [ "$V_BROKE" -gt 0 ] || [ "$PASSED" -eq 0 ]; then
+            SUITE_FAILED=true;  VERDICT=":x: **FAIL**"
           else
-            VERDICT=":x: **FAIL**"
+            SUITE_FAILED=false; VERDICT=":white_check_mark: **PASS**"
           fi
+          {
+            echo "V_NEW=$V_NEW"; echo "V_FIXED=$V_FIXED"; echo "V_KNOWN=$V_KNOWN"
+            echo "V_BROKE=$V_BROKE"; echo "SUITE_FAILED=$SUITE_FAILED"
+          } >> "$GITHUB_ENV"
+          # "N5 ([huntridge-labs/argus#436](https://github.com/huntridge-labs/argus/issues/436))"
+          with_issue() {
+            local out="" id iss
+            for id in $1; do
+              iss=$(jq -r --arg i "$id" '.[$i] // empty' <<<"$XF_LABELS")
+              if [[ "$iss" =~ ^([^#]+)#([0-9]+)$ ]]; then
+                out+="${out:+, }$id ([$iss](${GITHUB_SERVER_URL}/${BASH_REMATCH[1]}/issues/${BASH_REMATCH[2]}))"
+              else
+                out+="${out:+, }$id"
+              fi
+            done
+            echo "${out:-&mdash;}"
+          }
 
           # Helper: count pass/fail/skip within a JSON array
           cat_icon() {
@@ -336,6 +765,13 @@ jobs:
             echo "**Scope:** \`$SCOPE\` &nbsp; **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "**Verdict:** $VERDICT &nbsp; ($PASSED passed, $FAILED failed, $SKIPPED skipped — $PASS_RATE% pass rate)"
             echo ""
+            echo "| Why the run is this colour | Tests |"
+            echo "|---|---|"
+            echo "| Known argus failures — red on their own jobs, but they do not fail the run | $(with_issue "$V_KNOWN") |"
+            echo "| New failures — these fail the run | ${V_NEW:-&mdash;} |"
+            echo "| Known failures that now pass — remove from \`expected-failures.json\` | ${V_FIXED:-&mdash;} |"
+            [ "$V_BROKE" -gt 0 ] && echo "| Categories that failed without reporting a failing test | $V_BROKE |"
+            echo ""
             echo "---"
             echo ""
 
@@ -344,15 +780,21 @@ jobs:
             echo ""
             echo "| Status | Category | Tests | Passed |"
             echo "|--------|----------|-------|--------|"
-            echo "| $(cat_icon "$UNIT_RESULT") | Unit Tests (U1-U5) | 5 | $(cat_counts "$UNIT_ARR") |"
-            echo "| $(cat_icon "$ACTIONS_RESULT") | Direct Action Tests (A1-A5) | 5 | $(cat_counts "$ACTIONS_ARR") |"
-            echo "| $(cat_icon "$REMOTE_RESULT") | Remote Mode Tests (R1-R12) | 12 | $(cat_counts "$REMOTE_ARR") |"
-            echo "| $(cat_icon "$DISCOVER_RESULT") | Discover Mode Tests (D1-D3) | 3 | $(cat_counts "$DISCOVER_ARR") |"
-            echo "| $(cat_icon "$COMBO_RESULT") | Combination Tests (C1-C15) | 15 | $(cat_counts "$COMBO_ARR") |"
-            echo "| $(cat_icon "$SCN_RESULT") | SCN Detector Tests (S1-S25) | 25 | $(cat_counts "$SCN_ARR") |"
-            echo "| $(cat_icon "$I1") | Infrastructure Scan (I1) | 1 | $([ "$I1_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
+            echo "| $(cat_icon "$UNIT_RESULT") | Unit Tests | 5 | $(cat_counts "$UNIT_ARR") |"
+            echo "| $(cat_icon "$ACTIONS_RESULT") | Direct Action Tests | 5 | $(cat_counts "$ACTIONS_ARR") |"
+            echo "| $(cat_icon "$REMOTE_RESULT") | Remote Mode Tests | 11 | $(cat_counts "$REMOTE_ARR") |"
+            echo "| $(cat_icon "$DISCOVER_RESULT") | Discover Mode Tests | 4 | $(cat_counts "$DISCOVER_ARR") |"
+            echo "| $(cat_icon "$COMBO_RESULT") | Combination Tests | 11 | $(cat_counts "$COMBO_ARR") |"
+            echo "| $(cat_icon "$EDGE_RESULT") | Edge & Adversarial Tests | 13 | $(cat_counts "$EDGE_ARR") |"
+            echo "| $(cat_icon "$WF_RESULT") | Top-level Workflow Tests | 4 | $(cat_counts "$WF_ARR") |"
+            echo "| $(cat_icon "$SCN_RESULT") | SCN Detector Tests | 25 | $(cat_counts "$SCN_ARR") |"
+            echo "| $(cat_icon "$RUNTIME_RESULT") | Runtime Environment Tests | 5 | $(cat_counts "$RUNTIME_ARR") |"
+            echo "| $(cat_icon "$I1") | Happy Path (I1) | 1 | $([ "$I1_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
             echo "| $(cat_icon "$I2") | No Hardcoded URLs (I2) | 1 | $([ "$I2_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
             echo "| $(cat_icon "$I3") | Config-Driven Scan (I3) | 1 | $([ "$I3_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
+            echo "| $(cat_icon "$I4") | Dispatch Targets (I4) | 1 | $([ "$I4_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
+            echo "| $(cat_icon "$I5") | Infrastructure Scan (I5) | 1 | $([ "$I5_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
+            echo "| $(cat_icon "$I6") | No Duplicate Tests (I6) | 1 | $([ "$I6_STATUS" = "pass" ] && echo "1" || echo "0")/1 |"
             echo ""
             echo "---"
             echo ""
@@ -402,6 +844,24 @@ jobs:
               '.[] | "| \(if .status == "pass" then ":white_check_mark:" elif .status == "FAIL" then ":x:" elif .status == "skip" then ":next_track_button:" else ":grey_question:" end) | \(.id) | \(.name) | \(.detail) | [log](\($url)) |"'
             echo ""
 
+            # ---- Section: Edge & Adversarial Tests ----
+            echo "### Edge & Adversarial Tests"
+            echo ""
+            echo "| Status | ID | Name | Detail | Log |"
+            echo "|--------|----|------|--------|-----|"
+            echo "$EDGE_ARR" | jq -r --arg url "$RUN_URL" \
+              '.[] | "| \(if .status == "pass" then ":white_check_mark:" elif .status == "FAIL" then ":x:" elif .status == "skip" then ":next_track_button:" else ":grey_question:" end) | \(.id) | \(.name) | \(.detail) | [log](\($url)) |"'
+            echo ""
+
+            # ---- Section: Top-level Workflow Tests ----
+            echo "### Top-level Workflow Tests"
+            echo ""
+            echo "| Status | ID | Name | Detail | Log |"
+            echo "|--------|----|------|--------|-----|"
+            echo "$WF_ARR" | jq -r --arg url "$RUN_URL" \
+              '.[] | "| \(if .status == "pass" then ":white_check_mark:" elif .status == "FAIL" then ":x:" elif .status == "skip" then ":next_track_button:" else ":grey_question:" end) | \(.id) | \(.name) | \(.detail) | [log](\($url)) |"'
+            echo ""
+
             # ---- Section: SCN Detector Tests ----
             echo "### SCN Detector Tests"
             echo ""
@@ -425,31 +885,23 @@ jobs:
             echo "**Total: $TOTAL tests** &nbsp; :white_check_mark: $PASSED passed &nbsp; :x: $FAILED failed &nbsp; :next_track_button: $SKIPPED skipped"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Fail if any test category failed
+      # Red on what CHANGED, not on what is known. A test in
+      # expected-failures.json that fails is a known argus bug: noted, not red.
+      # Red is a failure not on that list, a listed test that PASSES (argus
+      # fixed it -- remove the entry so the list cannot go stale), or a category
+      # that failed without reporting a failing test (it broke before it could).
+      - name: Fail on a new failure, or on a known one that is fixed
         id: verdict
-        env:
-          UNIT: ${{ needs.unit-tests.result }}
-          ACTIONS: ${{ needs.action-tests.result }}
-          REMOTE: ${{ needs.remote-tests.result }}
-          DISCOVER: ${{ needs.discover-tests.result }}
-          COMBO: ${{ needs.combination-tests.result }}
-          SCN: ${{ needs.scn-tests.result }}
-          I1: ${{ needs.i1-infrastructure-scan.result }}
-          I2: ${{ needs.i2-no-hardcoded-urls.result }}
-          I3: ${{ needs.i3-config-scan.result }}
         run: |
-          FAILED=0
-          for result in "$UNIT" "$ACTIONS" "$REMOTE" "$DISCOVER" "$COMBO" "$SCN" "$I1" "$I2" "$I3"; do
-            [ "$result" = "failure" ] && FAILED=$((FAILED + 1))
-          done
-
-          if [ "$FAILED" -gt 0 ]; then
-            echo "suite_failed=true" >> "$GITHUB_OUTPUT"
-            echo "::error::$FAILED test category(ies) failed"
-          else
-            echo "suite_failed=false" >> "$GITHUB_OUTPUT"
-            echo "All test categories passed or were skipped"
-          fi
+          # Computed once in "Generate consolidated summary" (see there) and
+          # read from GITHUB_ENV, so the gate and the run page cannot disagree.
+          [ -n "${V_KNOWN:-}" ] && echo "::notice title=Known argus failures::$V_KNOWN -- listed in .github/data/expected-failures.json with their upstream issues."
+          [ -n "${V_NEW:-}" ] && echo "::error title=New failures::$V_NEW -- not in expected-failures.json."
+          [ -n "${V_FIXED:-}" ] && echo "::error title=Expected failure now passes::$V_FIXED -- argus appears to have fixed this. Remove it from .github/data/expected-failures.json."
+          [ "${V_BROKE:-0}" -gt 0 ] && echo "::error::$V_BROKE job(s) failed without reporting a failing test -- a category broke before it could report."
+          echo "suite_failed=${SUITE_FAILED:-true}" >> "$GITHUB_OUTPUT"
+          [ "${SUITE_FAILED:-true}" = "false" ] && echo "Every failure is a known argus bug; nothing new, nothing fixed."
+          exit 0
 
       # ---- Dashboard generation & deployment ----
       - name: Checkout repository
@@ -472,26 +924,137 @@ jobs:
           echo "argus_sha=${ARGUS_SHA}" >> "$GITHUB_OUTPUT"
           echo "argus_sha_short=${ARGUS_SHA_SHORT}" >> "$GITHUB_OUTPUT"
 
-          echo "Resolved ${ARGUS_REPO}@${ARGUS_REF} to ${ARGUS_SHA_SHORT}"
+          # The release version that ref reports -- what a consumer would pin to.
+          ARGUS_VERSION=$(gh api "repos/${ARGUS_REPO}/contents/version.yaml?ref=${ARGUS_REF}" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
+            | head -1 | awk '{print $1}' | tr -d '"' ) || ARGUS_VERSION=""
+          echo "argus_version=${ARGUS_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch previous history.json
+          echo "Resolved ${ARGUS_REPO}@${ARGUS_REF} to ${ARGUS_SHA_SHORT} (version ${ARGUS_VERSION:-unknown})"
+
+      # WHERE THE LIVE SITE ACTUALLY IS. Resolved once, from the Pages API,
+      # because `<owner>.github.io/<repo>` is a guess that is wrong the moment
+      # a custom domain is configured -- and it is: this fork serves from
+      # alanwang.dev. Every fetch below reads the live site to carry the other
+      # branches forward, so guessing the host wrong does not degrade the site,
+      # it deletes it.
+      - name: Resolve the published site URL
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p _site
-          # Try to fetch history.json from the GitHub API (gh-pages branch or pages artifact)
-          PAGES_URL="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d/ -f2)/history.json"
-          curl -sSf "$PAGES_URL" -o _site/history.json 2>/dev/null || echo '[]' > _site/history.json
-          # Validate JSON
-          jq empty _site/history.json 2>/dev/null || echo '[]' > _site/history.json
-          echo "History entries loaded: $(jq 'length' _site/history.json)"
+          set -uo pipefail
+          SITE=$(gh api "repos/${{ github.repository }}/pages" --jq '.html_url' 2>/dev/null || true)
+          if [ -z "$SITE" ] || [ "$SITE" = "null" ]; then
+            SITE="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d/ -f2)"
+            echo "::warning::Pages API returned no html_url; falling back to the conventional URL $SITE"
+          fi
+          SITE="${SITE%/}"
+          # The API reports http:// whenever https_enforced is false, which is
+          # the default for a custom domain. HTTPS is usually served anyway, so
+          # prefer it and fall back only if it genuinely does not answer --
+          # these fetches decide what the deploy keeps, over the open internet.
+          if [ "${SITE#http://}" != "$SITE" ]; then
+            HTTPS="https://${SITE#http://}"
+            if curl -sSfL -o /dev/null --max-time 20 "$HTTPS/" 2>/dev/null; then
+              SITE="$HTTPS"
+            else
+              echo "::notice::$HTTPS did not answer; reading the site over http."
+            fi
+          fi
+          echo "site_url=$SITE" >> "$GITHUB_ENV"
+          echo "Live site: $SITE"
+
+      # Each branch gets its own site under /<branch>/, so dev results never
+      # overwrite main's and the two histories stay independent. This runs
+      # before the branch list below, which reads the slug it sets.
+      - name: Fetch previous history.json for this branch
+        id: branch
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          # One slug for both the artifact name and the site directory.
+          # Artifact names reject / : " < > | * ? \ \r \n; a nested directory
+          # would also make every relative link on the page depth-dependent,
+          # so feat/foo publishes at /feat-foo/ and displays as "feat/foo".
+          SLUG=$(echo "$BRANCH" | tr '/:"<>|*?\\' '-')
+          mkdir -p "_site/$SLUG"
+          # -L: a custom domain answers the apex with a 301, and curl without
+          # it exits 0 having written the redirect body, so `||` never fires
+          # and the history is silently reset to [] on every run.
+          curl -sSfL "$site_url/$SLUG/history.json" -o "_site/$SLUG/history.json" 2>/dev/null \
+            || echo '[]' > "_site/$SLUG/history.json"
+          jq empty "_site/$SLUG/history.json" 2>/dev/null || echo '[]' > "_site/$SLUG/history.json"
+          {
+            echo "branch_dir=$SLUG"
+            echo "branch_slug=$SLUG"
+            echo "branch_name=$BRANCH"
+          } >> "$GITHUB_ENV"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "Branch '$BRANCH' publishes at /$SLUG/; history entries: $(jq 'length' "_site/$SLUG/history.json")"
+
+      # The branch list every page's switcher needs. Read from the LIVE site
+      # before anything is regenerated, because the pages are written before
+      # the preserve step runs and so cannot see their siblings otherwise.
+      - name: Fetch the published branch list
+        run: |
+          curl -sSfL "$site_url/branches.json" -o /tmp/branches.json 2>/dev/null || echo '[]' > /tmp/branches.json
+          jq empty /tmp/branches.json 2>/dev/null || echo '[]' > /tmp/branches.json
+          # This branch may not be listed yet (first run), so add it.
+          B=$(jq -c --arg s "${{ env.branch_slug }}" --arg n "${{ env.branch_name }}" \
+                '(map(select(.slug != $s)) + [{slug:$s, name:$n}]) | sort_by(.slug)' /tmp/branches.json)
+          echo "BRANCHES_JSON=$B" >> "$GITHUB_ENV"
+          echo "branch switcher will list: $(jq -r 'map(.slug)|join(", ")' <<<"$B")"
+
+      # Which parts of the ref are actually under test. Runs before the
+      # dashboard so the board can state the split next to the ref rather than
+      # implying a branch run tested the whole branch.
+      - name: Audit ref liveness
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARGUS_REPO: huntridge-labs/argus
+        run: |
+          mkdir -p _site/liveness
+          bash .github/scripts/audit-ref-liveness.sh \
+            "${{ inputs.argus_ref || 'main' }}" _site/liveness/ref-liveness.json
+
+      # Per-job log URLs so the dashboard's Logs column points at the job that ran
+      # each test rather than repeating the run URL on every row. conclusion and
+      # the first failed step come too: a test spawns several jobs (discover,
+      # scan, summary) and the useful log is the one that failed, at the step
+      # that failed, not whichever the API happened to list first -- which is
+      # often a skipped job with an empty log. Best effort: if this fails the
+      # dashboard falls back to the run URL.
+      - name: Map test jobs to their logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          JOBS=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+            --paginate --jq '.jobs[] | {
+              name: .name,
+              url: .html_url,
+              conclusion: .conclusion,
+              failedStep: ([.steps[]? | select(.conclusion == "failure") | .number] | first)
+            }' 2>/dev/null \
+            | jq -s -c '.' 2>/dev/null) || JOBS='[]'
+          [ -n "$JOBS" ] || JOBS='[]'
+          echo "Mapped $(echo "$JOBS" | jq 'length') job(s) to log URLs"
+          {
+            echo "JOBS_JSON<<GHEOF"
+            echo "$JOBS"
+            echo "GHEOF"
+          } >> "$GITHUB_ENV"
 
       - name: Generate dashboard
         env:
+          JOBS_JSON: ${{ env.JOBS_JSON }}
           ALL_JSON: ${{ env.ALL_JSON }}
           UNIT_JSON: ${{ needs.unit-tests.outputs.results }}
           ACTIONS_JSON: ${{ needs.action-tests.outputs.results }}
           REMOTE_JSON: ${{ needs.remote-tests.outputs.results }}
           DISCOVER_JSON: ${{ needs.discover-tests.outputs.results }}
           COMBO_JSON: ${{ needs.combination-tests.outputs.results }}
+          EDGE_JSON: ${{ needs.edge-tests.outputs.results }}
+          WF_JSON: ${{ needs.workflow-tests.outputs.results }}
           SCN_JSON: ${{ needs.scn-tests.outputs.results }}
           REGRESSION_JSON: ${{ env.REGRESSION_JSON }}
           UNIT_RESULT: ${{ needs.unit-tests.result }}
@@ -499,20 +1062,228 @@ jobs:
           REMOTE_RESULT: ${{ needs.remote-tests.result }}
           DISCOVER_RESULT: ${{ needs.discover-tests.result }}
           COMBO_RESULT: ${{ needs.combination-tests.result }}
+          EDGE_RESULT: ${{ needs.edge-tests.result }}
+          WF_RESULT: ${{ needs.workflow-tests.result }}
           SCN_RESULT: ${{ needs.scn-tests.result }}
-          I1_RESULT: ${{ needs.i1-infrastructure-scan.result }}
+          I1_RESULT: ${{ needs.i1-happy-path.result }}
           I2_RESULT: ${{ needs.i2-no-hardcoded-urls.result }}
           I3_RESULT: ${{ needs.i3-config-scan.result }}
+          I4_RESULT: ${{ needs.i4-dispatch-targets-cover-refs.result }}
+          I5_RESULT: ${{ needs.i5-infrastructure-scan.result }}
+          I6_RESULT: ${{ needs.i6-no-duplicate-tests.result }}
+          RUNTIME_JSON: ${{ needs.runtime-env-tests.outputs.results }}
+          RUNTIME_RESULT: ${{ needs.runtime-env-tests.result }}
           SCOPE: ${{ inputs.scope || 'all' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
           REPO: ${{ github.repository }}
-          PAGES_DIR: _site
+          # Pins each table row's "source" link to the exact commit of this
+          # repo that defined the test, rather than drifting with main.
+          SELF_SHA: ${{ github.sha }}
+          BRANCHES_JSON: ${{ env.BRANCHES_JSON }}
+          BRANCH_SLUG: ${{ env.branch_slug }}
+          BRANCH_NAME: ${{ env.branch_name }}
+          PAGES_DIR: _site/${{ env.branch_dir }}/tests
+          SHARED_DIR: _site/${{ env.branch_dir }}
+          SITE_UP: "../"
+          LIVENESS_FILE: _site/liveness/ref-liveness.json
           ARGUS_REPO: ${{ steps.argus-ref.outputs.argus_repo }}
           ARGUS_REF: ${{ steps.argus-ref.outputs.argus_ref }}
           ARGUS_SHA: ${{ steps.argus-ref.outputs.argus_sha }}
           ARGUS_SHA_SHORT: ${{ steps.argus-ref.outputs.argus_sha_short }}
+          ARGUS_VERSION: ${{ steps.argus-ref.outputs.argus_version }}
         run: bash .github/scripts/generate-dashboard.sh
+
+      # Pages replaces the WHOLE site on every deployment, so a branch that
+      # publishes must carry every other branch's pages with it or it deletes
+      # them. This step was lost in a0a3871 when the hub was removed, and the
+      # next branch to publish took the entire site down to itself -- main,
+      # dev and the root index all 404. Restored, and it runs BEFORE the root
+      # index so discovery can see the branches it just pulled back.
+      - name: Preserve every other branch's site
+        run: |
+          set -uo pipefail
+          MINE="${{ env.branch_slug }}"
+
+          # Three outcomes, and they are not the same thing:
+          #   0  -> a list came back; use it.
+          #   22 -> -f saw a 4xx. Nothing has ever published here. Empty is
+          #         the truth, and deleting nothing is correct.
+          #   *  -> DNS, TLS, a proxy, a 5xx. We do not know what is live, and
+          #         a deploy built on that guess replaces the whole site with
+          #         whatever we managed to assemble. Refuse instead.
+          # The old code collapsed all three into `|| echo '[]'` and then
+          # backfilled a hardcoded [main, dev], so a fetch that failed for any
+          # reason silently deleted every branch outside that pair. That is
+          # what removed fix/pr427-eval after it had published correctly.
+          HTTP=$(curl -sSL -o /tmp/branches.json -w '%{http_code}' \
+                   "$site_url/branches.json" 2>/dev/null) || RC=$?
+          RC=${RC:-0}
+          if [ "$RC" -eq 0 ] && [ "$HTTP" = "200" ]; then
+            jq empty /tmp/branches.json 2>/dev/null || {
+              echo "::error::$site_url/branches.json returned 200 but is not JSON. Refusing to deploy, because a site assembled from an unknown branch list deletes the branches it failed to see."
+              exit 1
+            }
+          elif [ "$RC" -eq 0 ] && [ "$HTTP" = "404" ]; then
+            echo "No branches.json live yet ($HTTP); nothing has published here before."
+            echo '[]' > /tmp/branches.json
+          else
+            echo "::error::Could not read $site_url/branches.json (curl rc=$RC, http=$HTTP). Refusing to deploy: Pages replaces the whole site, so publishing without knowing which branches are live would delete them."
+            exit 1
+          fi
+
+          KEPT=0
+          for SLUG in $(jq -r '.[].slug' /tmp/branches.json); do
+            [ "$SLUG" = "$MINE" ] && continue
+            mkdir -p "_site/$SLUG/tests"
+            GOT=0
+            for f in index.html history.json favicon.png tests/index.html; do
+              # -L for the same reason as everywhere else: without it a custom
+              # domain's 301 body gets written into the file and counted as a
+              # successful preserve, which is how /dev/ became a 162-byte
+              # "301 Moved Permanently" stub that still rendered on the index.
+              curl -sSfL "$site_url/$SLUG/$f" -o "_site/$SLUG/$f" 2>/dev/null || continue
+              # -L stopped NEW stubs, but one already published is a real file
+              # served 200, so each deploy fetched it and carried it forward:
+              # /dev/ stayed a "301 Moved Permanently" page for every file long
+              # after the fix. Check what came back, not just that something did.
+              case "$f" in
+                *.json) jq empty "_site/$SLUG/$f" 2>/dev/null || BAD=1 ;;
+                *.html) grep -qiE '<title>[[:space:]]*30[1278] ' "_site/$SLUG/$f" && BAD=1 ;;
+                *.png)  [ "$(head -c 4 "_site/$SLUG/$f" | od -An -tx1 | tr -d ' \n')" = "89504e47" ] || BAD=1 ;;
+              esac
+              if [ "${BAD:-0}" = 1 ]; then
+                echo "  $SLUG/$f: not a real page (redirect stub or unparseable) -- dropped"
+                rm -f "_site/$SLUG/$f"; BAD=0; continue
+              fi
+              GOT=$((GOT + 1))
+            done
+            rmdir "_site/$SLUG/tests" 2>/dev/null || true
+            if [ "$GOT" -eq 0 ]; then
+              rm -rf "_site/$SLUG"
+              echo "  $SLUG: nothing live to preserve"
+            else
+              touch "_site/$SLUG/.nojekyll"
+              KEPT=$((KEPT + 1))
+              echo "  $SLUG: kept $GOT file(s)"
+            fi
+          done
+          echo "Preserved $KEPT other branch(es)"
+
+      # /<branch>/ is a REDIRECT, not a page. It used to serve a hub that
+      # restated the figures already on the index card and cost a click to
+      # reach the page you wanted. The index carries those figures per branch
+      # now, so the middle level was pure repetition. Kept as a redirect rather
+      # than removed so trimming a URL back a level, or an old bookmark, still
+      # lands somewhere useful.
+      - name: Point the branch root at the board
+        run: |
+          set -euo pipefail
+          D="_site/${{ env.branch_dir }}"
+          mkdir -p "$D"
+          {
+            printf '%s\n' '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            printf '%s\n' '<meta http-equiv="refresh" content="0; url=tests/">'
+            printf '%s\n' '<link rel="canonical" href="tests/">'
+            printf '%s\n' '<title>Argus Test Suite</title></head>'
+            printf '%s\n' '<body><p>Redirecting to <a href="tests/">test results</a>.</p></body></html>'
+          } > "$D/index.html"
+          echo "Wrote $D/index.html -> tests/"
+
+      # The site root: one card per published branch, with that branch's
+      # headline figures. Read from each <branch>/history.json rather than
+      # recomputed, so the root cannot disagree with the board it links to.
+      # Was an inline heredoc listing branch names against two hardcoded
+      # sentences and no figures at all -- the top of the site said less than
+      # any page beneath it.
+      # Before the root index, not after: the root discovers branches by
+      # looking for directories holding an index.html, and the staging dir
+      # sitting in _site was both noise and -- via the loop's exit status --
+      # fatal.
+      - name: Drop the liveness staging directory
+        if: always()
+        run: rm -rf _site/liveness
+
+      - name: Write the root index
+        env:
+          SITE_DIR: _site
+          FALLBACK: ${{ env.branch_slug }}
+        run: bash .github/scripts/generate-root-index.sh
+
+      # Every branch gets the rendered site as a downloadable artifact, so a
+      # reviewer can open the board for a branch that cannot publish. This also
+      # means generate-dashboard.sh is exercised on every run rather than only
+      # after a merge to main.
+      - name: Upload rendered dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-${{ env.branch_slug }}
+          path: _site
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Fail job if suite failed
+        if: steps.verdict.outputs.suite_failed == 'true'
+        run: exit 1
+
+  # --------------------------------------------------------------------------
+  # Publish to GitHub Pages.
+  #
+  # Split from `summary` because `environment:` is a job-level key and cannot be
+  # made conditional. Keeping it on the generating job meant the whole job was
+  # rejected on any branch the environment does not allow.
+  #
+  # `needs: summary` without `if: always()` would skip this whenever the suite
+  # failed -- and the suite failing is exactly when the board is worth reading.
+  # --------------------------------------------------------------------------
+  # A CANCELLED run must not publish. `summary` and `publish` are both
+  # `if: always()`, which is right for a run that FAILED -- a failing suite is
+  # exactly when the board is worth reading. It is wrong for a cancelled one:
+  # the tests did not fail, they were stopped, and every unfinished job reports
+  # as skipped. Publishing that overwrites a complete board with a partial one
+  # whose missing rows read as "not run", which is indistinguishable from a
+  # suite that genuinely skipped them.
+  #
+  # Observed: two pushes in quick succession cancelled run 35610596763 mid-
+  # flight -- 42 jobs killed by cancel-in-progress and by the next run's
+  # reap-orphans -- and the summary still published 62 of 88 tests as the
+  # current state of main.
+  # WHERE THIS PUBLISHES. main always. Other assessed branches only when the
+  # repository opts in with the variable PUBLISH_ALL_BRANCHES=true -- which also
+  # needs its github-pages environment to allow those branches. That is repo
+  # configuration, not workflow code: the fork that hosts per-branch boards sets
+  # both; a repository that deploys from main only sets neither, and this job is
+  # SKIPPED on its other branches instead of failing at the environment gate
+  # with no steps run. A deploy the repository does not allow is not a test
+  # failure, and reporting it as one made every non-main run red for a setting.
+  # The rendered board is still uploaded as an artifact on every branch.
+  publish:
+    name: "Publish dashboard"
+    runs-on: ubuntu-latest
+    needs: summary
+    if: >-
+      always() && !cancelled()
+      && needs.summary.result != 'skipped'
+      && needs.summary.outputs.run_complete == 'true'
+      && (github.ref_name == 'main'
+          || (vars.PUBLISH_ALL_BRANCHES == 'true'
+              && (github.ref_name == 'dev'
+                  || startsWith(github.ref_name, 'feat/') || startsWith(github.ref_name, 'fix/'))))
+    permissions:
+      contents: read      # checkout is not used here, but download-artifact reads the run
+      actions: read       # download-artifact@v4
+      pages: write        # deploy-pages
+      id-token: write     # deploy-pages OIDC
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}${{ github.ref_name }}/
+    steps:
+      - name: Download the rendered dashboard
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.summary.outputs.dashboard_artifact }}
+          path: _site
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -525,7 +1296,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deploy
         uses: actions/deploy-pages@v4
-
-      - name: Fail job if suite failed
-        if: steps.verdict.outputs.suite_failed == 'true'
-        run: exit 1

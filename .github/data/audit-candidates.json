@@ -1,0 +1,101 @@
+{
+  "_comment": [
+    "PROMPT 7 -- candidate tests, NOT written. The list is for picking from.",
+    "",
+    "All four blockers in argus PR #427 passed all 66 of argus's own checks.",
+    "The reviewer's closing line was 'All 66 checks pass, so none of the four",
+    "above is caught today.' Three shapes explain how:",
+    "",
+    "  STRUCTURE  a test inspected workflow YAML as text where behaviour was",
+    "             the thing that mattered;",
+    "  ENVIRONMENT  no test ran on a host without a container runtime;",
+    "  UNREAD DECISION  a choice was recorded in a log line nothing asserts on.",
+    "",
+    "This suite is audited for the same three shapes below. Each entry names",
+    "the failure it would have caught, because a candidate that cannot name one",
+    "is a test looking for a reason to exist."
+  ],
+  "candidates": [
+    {
+      "id": "CAND-1",
+      "shape": "structure",
+      "where": "I2 (test-suite.yml), 'no hardcoded URLs'",
+      "what": "I2 parses action.yml and greps `run:` bodies for https://github.com. It reads text and never executes anything.",
+      "would_catch": "A GHES-hostile URL that is assembled at runtime -- \"https://\" + \"github.com\" , or a default in a Python helper the action calls rather than in the run block itself. I2 passes and a GHES consumer still breaks.",
+      "instead": "Run the action with GITHUB_SERVER_URL set to a non-github.com host and assert nothing egresses to github.com, or that the emitted links carry the configured host.",
+      "cost": "medium"
+    },
+    {
+      "id": "CAND-2",
+      "shape": "structure",
+      "where": "I4 (added in this change)",
+      "what": "I4 greps dispatch targets for `uses:` pins and compares them to argus-refs.json. Pure text comparison.",
+      "would_catch": "Nothing behavioural -- and that is the point. It is listed here so the audit is honest about its own additions. It earns its place because `uses:` cannot be parameterised, so there is genuinely nothing to execute until a ref has a job; the structure IS the contract. If that ever stops being true, this should be replaced by a dispatch that asserts a scan job actually ran.",
+      "instead": "Keep, with the caveat recorded.",
+      "cost": "n/a"
+    },
+    {
+      "id": "CAND-3",
+      "shape": "environment",
+      "where": "every container suite",
+      "what": "Every test runs on ubuntu-latest with Docker present and rootful. Hardened, rootless and podman hosts are never exercised. N1/N2 (added here) cover the no-runtime case only.",
+      "would_catch": "argus resolving a runtime it cannot actually use -- podman present but the socket unreachable, or Docker present in rootless mode where --privileged operations fail. Today that surfaces as a consumer bug report, not a red test.",
+      "instead": "One matrix leg on a container job with podman, and one with rootless Docker. Both assert a default scan still completes.",
+      "cost": "high"
+    },
+    {
+      "id": "CAND-4",
+      "shape": "environment",
+      "where": "GAP-5, GHES",
+      "what": "Already a declared gap, blocked on infrastructure. Listed so the audit does not present it as newly discovered.",
+      "would_catch": "Anything CAND-1 would, plus API-shape differences.",
+      "instead": "Unchanged -- still blocked.",
+      "cost": "blocked"
+    },
+    {
+      "id": "CAND-5",
+      "shape": "unread-decision",
+      "where": "E3, 'messy scanners normalise'",
+      "what": "E3 passes `trivy , TRIVY ,grype,  Trivy` and asserts the run succeeds. It never asserts WHICH scanners ran.",
+      "would_catch": "Normalisation that silently drops a scanner -- dedupe to `trivy` alone, or a case fold that loses `grype`. The run still exits 0 and E3 stays green over a scan half the size the caller asked for. This is the same silent-pass shape as the bug the suite exists to catch, in the test meant to guard the input path.",
+      "instead": "Assert on the child run's scan-outputs.json (the mechanism added here for D5) or on the report artifact, that both trivy and grype findings are present.",
+      "cost": "low"
+    },
+    {
+      "id": "CAND-6",
+      "shape": "unread-decision",
+      "where": "E13, foreign-architecture image",
+      "what": "E13 scans arm64v8/alpine:3.18 from an amd64 runner and asserts the run succeeds. It never asserts which platform was selected.",
+      "would_catch": "Exactly reviewer blocker 4: a retry that falls back to linux/amd64 after reading a manifest saying arm64-only. If some other path rescues the scan, E13 is green and the wrong-architecture decision is invisible. N4 (added here) asserts the choice, but only on the SDK-direct path -- E13 itself still cannot see it.",
+      "instead": "Have the dispatch target surface the resolved platform as a scan output, the way the counts are surfaced now.",
+      "cost": "medium"
+    },
+    {
+      "id": "CAND-7",
+      "shape": "unread-decision",
+      "where": "W1-W3, hardening scanner selection",
+      "what": "Each asserts the hardening workflow concludes success with a given scanners list. None asserts that the named scanners are the ones that ran.",
+      "would_catch": "The DEFAULT_SCANNERS substitution that W4 now catches for an UNKNOWN token, but for a VALID one -- an alias that silently resolves to the wrong scanner, or a selection that quietly runs the full set. Green either way.",
+      "instead": "Count non-skipped jobs in the child run and assert the set matches the request. The child run id is already captured.",
+      "cost": "medium"
+    },
+    {
+      "id": "CAND-8",
+      "shape": "unread-decision",
+      "where": "W6 / scanners: none (not written)",
+      "what": "PR #427 notes `scanners: none` hit the empty-selection fallback and ran the FULL default set. Nothing asserts the fixed behaviour.",
+      "would_catch": "A regression of exactly that: asking for nothing and getting everything, reported green. Conclusion-only assertion cannot see it, which is why this was left off the written set rather than added as a conclusion check.",
+      "instead": "Needs CAND-7's job-counting mechanism first; then it is a one-line matrix row.",
+      "cost": "low once CAND-7 exists"
+    },
+    {
+      "id": "CAND-9",
+      "shape": "structure",
+      "where": "U1-U5, the unit rows",
+      "what": "Each unit row stands for a whole pytest file, and the dashboard folds `pytest --collect-only` names into search. Collection is best-effort: a job that collects nothing says so.",
+      "would_catch": "Nothing today -- but the failure mode is that a path moves upstream, collection silently returns zero, and the row reports 'no assurance' in a way a reader skims past. Worth asserting a minimum collected count per file so a move is loud.",
+      "instead": "Assert collected > 0 per unit file, and fail the row if a previously-collecting file drops to zero.",
+      "cost": "low"
+    }
+  ]
+}

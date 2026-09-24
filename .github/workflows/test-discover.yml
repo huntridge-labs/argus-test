@@ -2,6 +2,22 @@ name: "Discover Mode Tests"
 
 on:
   workflow_call:
+    inputs:
+      expected_failures:
+        description: 'JSON array of test ids from .github/data/expected-failures.json. A listed test still runs and still reports FAIL; its job just does not fail the run.'
+        required: false
+        type: string
+        default: '[]'
+      expected_labels:
+        description: 'JSON object mapping a known-failure test id to its upstream issue, shown in the job name.'
+        required: false
+        type: string
+        default: '{}'
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
     outputs:
       results:
         description: "JSON array of individual test results"
@@ -9,159 +25,228 @@ on:
 
 permissions:
   contents: read
+  actions: write        # dispatching argus-run.yml
   security-events: write
-  actions: read
   packages: read
   pull-requests: write
 
 # ============================================================================
-# Discover mode tests: container-scan.yml finds Dockerfiles in this repo
+# Discover mode tests: matrix over a parameter table, dispatch architecture.
 #
-# This repo has 3 Dockerfiles under tests/dockerfiles/:
-#   - good/Dockerfile      (FROM alpine:3.18 — builds and scans)
-#   - vulnerable/Dockerfile (FROM node:14-slim — builds, has CVEs)
-#   - broken/Dockerfile    (FROM nonexistent — fails to pull/build)
+# max-parallel: 1 is load-bearing, not tuning. These previously ran as a needs
+# chain (D2 needs D1, D3 needs D2, D4 needs D3) purely to serialise discover
+# runs, which all build the same Dockerfiles under tests/. The matrix expresses
+# that directly, and drops the `if: always()` D4 needed to survive a
+# deliberately-failing D3 -- under dispatch D3 is green when it passes.
 #
-# The discover job uses: find . -name "Dockerfile*" -not -path "./.git/*"
-# So all 3 will be found. The broken one should fail gracefully.
+# D3 and D4 assert argus FAILS, and are green when it does.
+#
+# D5 is a separate job rather than a matrix row: it needs `search_paths` and
+# the workflow_call outputs, which exist only on refs carrying argus PR #427,
+# and it asserts on those outputs rather than on the run's conclusion.
 # ============================================================================
 
 jobs:
-  # --------------------------------------------------------------------------
-  # D1: Discover mixed Dockerfiles (good + vulnerable + broken)
-  # --------------------------------------------------------------------------
-  d1-discover-mixed:
-    name: "D1: discover mixed"
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy,grype
-      fail_on_severity: none
-      allow_failure: false
+  discover:
+    name: "${{ matrix.t.id }}: ${{ matrix.t.name }}${{ fromJSON(inputs.expected_labels || '{}')[matrix.t.id] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')[matrix.t.id]) || '' }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), matrix.t.id) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        t:
+          - { id: D1, name: "discover mixed",           expect: success, scanners: "trivy,grype", sev: none,     allow: 'true'  }
+          - { id: D2, name: "discover trivy only",      expect: success, scanners: "trivy",       sev: none,     allow: 'true'  }
+          - { id: D3, name: "discover fail-closed",     expect: failure, scanners: "trivy,grype", sev: critical, allow: 'false' }
+          - { id: D4, name: "build gate (severity none)", expect: failure, scanners: "trivy",     sev: none,     allow: 'false' }
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-scan
+        with:
+          test_id: ${{ matrix.t.id }}
+          expect: ${{ matrix.t.expect }}
+          argus_ref: ${{ inputs.argus_ref || 'main' }}
+          scan_mode: discover
+          scanners: ${{ matrix.t.scanners }}
+          fail_on_severity: ${{ matrix.t.sev }}
+          allow_failure: ${{ matrix.t.allow }}
+      - name: Record result
+        if: always()
+        run: |
+          jq -n -c --arg id "${{ matrix.t.id }}" \
+                   --arg status "${{ steps.t.outputs.status || 'FAIL' }}" \
+                   --arg child "${{ steps.t.outputs.child_run_id }}" \
+                   '{id:$id, status:$status, child:$child}' > "result-${{ matrix.t.id }}.json"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testresult-${{ matrix.t.id }}
+          path: result-${{ matrix.t.id }}.json
+          retention-days: 7
+          if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # D2: Discover with trivy only
+  # Does the ref under test declare the workflow_call outputs D5 asserts on?
+  #
+  # D5 used to be gated on `argus_ref != 'main'`, which used a branch NAME as a
+  # proxy for a CAPABILITY. It was right only by coincidence: correct while the
+  # outputs existed on exactly one branch, silently wrong the moment a second
+  # branch carried them, and it would have kept D5 skipped after PR #427 merged
+  # until somebody remembered to delete the condition.
+  #
+  # Asking the ref directly is the same cost and cannot drift. If the probe
+  # cannot reach the ref at all it reports false, so D5 skips with a stated
+  # reason rather than failing on an assertion it could never evaluate.
   # --------------------------------------------------------------------------
-  d2-discover-trivy-only:
-    name: "D2: discover trivy only"
-    needs: d1-discover-mixed
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy
-      fail_on_severity: none
-      allow_failure: false
+  outputs-capability:
+    name: "Does argus@ref declare the scan outputs?"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      declared: ${{ steps.probe.outputs.declared }}
+    steps:
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARGUS_REF: ${{ inputs.argus_ref || 'main' }}
+        run: |
+          set -uo pipefail
+          BODY=$(gh api "repos/huntridge-labs/argus/contents/.github/workflows/container-scan.yml?ref=${ARGUS_REF}" \
+                   --jq '.content' 2>/dev/null | base64 -d 2>/dev/null)
+          if [ -z "$BODY" ]; then
+            echo "declared=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Could not read container-scan.yml at ${ARGUS_REF}; treating the outputs as absent."
+            exit 0
+          fi
+          # The outputs block is what D5 reads. images_scanned is the one that
+          # separates "clean" from "never ran", so it stands for the set.
+          if grep -q 'images_scanned:' <<<"$BODY" && grep -q 'overall_status:' <<<"$BODY"; then
+            echo "declared=true" >> "$GITHUB_OUTPUT"
+            echo "argus@${ARGUS_REF} declares the container-scan outputs; D5 will run."
+          else
+            echo "declared=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::argus@${ARGUS_REF} does not declare images_scanned/overall_status, so D5 is skipped."
+          fi
 
   # --------------------------------------------------------------------------
-  # D3: Discover with severity threshold
+  # D5: the MIXED-incomplete discover run.
+  #
+  # Two Dockerfiles under tests/dockerfiles/mixed: one builds and scans, one
+  # fails to build so its leg never writes argus-results.json.
+  #
+  # WHY THIS CASE AND NOT THE EASY ONE. "Every leg failed" is already caught by
+  # the IMAGES -eq 0 guard in container-scan.yml's summary. The mixed run is the
+  # common shape -- one image of several goes unscanned -- and it was silently
+  # green until PR #427, because the summary aggregated only the legs that
+  # produced files and never noticed the missing one. The reviewer's blocker 2
+  # is that the argus_scan_incomplete sentinel is warned about and then has no
+  # effect on overall_status, so this is expected RED against
+  # fix/container-scan-no-silent-pass at 4e2b481a.
+  #
+  # ASSERTED ON OUTPUTS, NOT ON THE CONCLUSION. A broken build already fails the
+  # run, so conclusion alone would pass for the wrong reason -- it cannot tell
+  # "the build broke" from "the build broke AND the summary noticed the image
+  # went unscanned". overall_status and images_scanned can, and they are what a
+  # consumer reads.
+  #
+  # The failure is induced, not mocked: the base image is withdrawn and the
+  # registry host does not resolve. See tests/dockerfiles/mixed/fails/Dockerfile.
+  #
+  # Skipped on refs that do not declare the outputs -- decided by asking the
+  # ref, not by matching its name. That reads as "no assurance" on the board
+  # rather than as a pass, which is the honest answer for a ref where the
+  # feature does not exist, and it starts running by itself once the ref has
+  # it.
   # --------------------------------------------------------------------------
-  d3-discover-severity:
-    name: "D3: discover + severity"
-    needs: d2-discover-trivy-only
-    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
-    with:
-      scan_mode: discover
-      scanners: trivy,grype
-      fail_on_severity: critical
-      allow_failure: false
+  d5-mixed-incomplete:
+    name: "D5: mixed-incomplete discover run"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: outputs-capability
+    if: needs.outputs-capability.outputs.declared == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        uses: ./.github/actions/argus-scan
+        with:
+          test_id: D5
+          # The scan genuinely fails -- one Dockerfile does not build. The
+          # assertion that matters is the output check below it.
+          expect: failure
+          argus_ref: ${{ inputs.argus_ref }}
+          scan_mode: discover
+          search_paths: tests/dockerfiles/mixed
+          scanners: trivy
+          fail_on_severity: none
+          allow_failure: 'false'
+          # images_scanned must count ONLY the leg that produced results, and
+          # overall_status must not be success while an image went unscanned.
+          assert_outputs: >-
+            .outputs.overall_status != "success"
+            and (.outputs.images_scanned | tonumber) == 1
+      - name: Record result
+        if: always()
+        run: |
+          jq -n -c --arg id "D5" \
+                   --arg status "${{ steps.t.outputs.status || 'FAIL' }}" \
+                   --arg child "${{ steps.t.outputs.child_run_id }}" \
+                   '{id:$id, status:$status, child:$child}' > "result-D5.json"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testresult-D5
+          path: result-D5.json
+          retention-days: 7
+          if-no-files-found: error
 
-  # --------------------------------------------------------------------------
-  # Validation job
-  # --------------------------------------------------------------------------
   validate-results:
     name: "Validate Discover Test Results"
     runs-on: ubuntu-latest
+    needs: [discover, d5-mixed-incomplete, outputs-capability]
+    if: always()
     outputs:
       results: ${{ steps.collect.outputs.results }}
-    needs:
-      - d1-discover-mixed
-      - d2-discover-trivy-only
-      - d3-discover-severity
-    if: always()
     steps:
-      - name: Validate test outcomes
-        env:
-          D1: ${{ needs.d1-discover-mixed.result }}
-          D2: ${{ needs.d2-discover-trivy-only.result }}
-          D3: ${{ needs.d3-discover-severity.result }}
-        run: |
-          FAILURES=0
-
-          check() {
-            local name="$1" got="$2" expected="$3"
-            if [ "$got" = "$expected" ]; then
-              echo "PASS $name: $got (expected $expected)"
-            else
-              echo "FAIL $name: $got (expected $expected)"
-              FAILURES=$((FAILURES + 1))
-            fi
-          }
-
-          echo "============================================"
-          echo "Discover Mode Test Validation"
-          echo "============================================"
-          echo ""
-
-          # D1: Should succeed (allow_failure handles broken build, continue-on-error on matrix)
-          check "D1 discover-mixed" "$D1" "success"
-
-          # D2: Should succeed (trivy only)
-          check "D2 discover-trivy-only" "$D2" "success"
-
-          # D3: May fail if vulnerable image has criticals
-          # Both success and failure are valid outcomes depending on node:14 CVEs
-          if [ "$D3" = "success" ] || [ "$D3" = "failure" ]; then
-            echo "PASS D3 discover-severity: $D3 (completed - threshold applied)"
-          else
-            echo "FAIL D3 discover-severity: $D3 (unexpected state)"
-            FAILURES=$((FAILURES + 1))
-          fi
-
-          echo ""
-          echo "============================================"
-          TOTAL=3
-          PASSED=$((TOTAL - FAILURES))
-          echo "Results: $PASSED/$TOTAL passed"
-          echo "============================================"
-
-          if [ "$FAILURES" -gt 0 ]; then
-            exit 1
-          fi
-
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: testresult-D*
+          path: ./results
+          merge-multiple: true
       - name: Build results JSON
         id: collect
-        if: always()
-        env:
-          D1: ${{ needs.d1-discover-mixed.result }}
-          D2: ${{ needs.d2-discover-trivy-only.result }}
-          D3: ${{ needs.d3-discover-severity.result }}
         run: |
-          to_status() {
-            local got="$1" expected="$2"
-            case "$got" in
-              skipped) echo "skip" ;;
-              cancelled) echo "cancel" ;;
-              *)
-                if [ "$got" = "$expected" ]; then
-                  echo "pass"
-                else
-                  echo "FAIL"
-                fi
-                ;;
-            esac
+          set -uo pipefail
+          cat > /tmp/detail.json <<'JSON'
+          {
+            "D1": ["discover mixed","Does argus complete a discover run over all three Dockerfiles when allow_failure is true?"],
+            "D2": ["discover trivy only","Does argus complete a discover run with trivy as the only scanner when allow_failure is true?"],
+            "D3": ["discover fail-closed","Does argus fail the workflow when a discover run hits both a broken build and criticals with allow_failure false?"],
+            "D4": ["build gate isolated","Does argus fail the workflow when a discovered Dockerfile does not build, even with the severity gate switched off?"],
+            "D5": ["mixed-incomplete discover run","When one of two discovered images fails to build, does container-scan.yml report a non-success overall_status and count only the image it actually scanned?"]
           }
-          # D3 accepts both success and failure
-          D3_STATUS="pass"
-          if [ "$D3" != "success" ] && [ "$D3" != "failure" ]; then
-            D3_STATUS="FAIL"
+          JSON
+          # D5 is skipped on refs that do not declare the outputs it asserts on.
+          # A missing artifact must surface as "skip" -- no assurance -- rather
+          # than vanishing and leaving the board reporting four tests as all.
+          if [ ! -f ./results/result-D5.json ]; then
+            echo '{"id":"D5","status":"skip","child":"","reason":"argus at the ref under test does not declare the container-scan.yml workflow_call outputs (images_scanned, overall_status) that this test asserts on. It will run by itself on a ref that does."}' > ./results/result-D5.json
+            echo "D5 produced no artifact; recorded as skip"
           fi
-          RESULTS=$(jq -n -c \
-            --arg d1 "$(to_status "$D1" success)" \
-            --arg d2 "$(to_status "$D2" success)" \
-            --arg d3 "$D3_STATUS" \
-            '[
-              {"id":"D1","name":"discover mixed","detail":"3 Dockerfiles (good+vulnerable+broken) with trivy,grype","status":$d1},
-              {"id":"D2","name":"discover trivy only","detail":"Dockerfile discovery with trivy scanner only","status":$d2},
-              {"id":"D3","name":"discover + severity","detail":"Dockerfile discovery with critical severity threshold","status":$d3}
-            ]')
+          RESULTS=$(jq -s -c --slurpfile d /tmp/detail.json '
+            # Filter by id rather than trusting the artifact glob. All suites share
+            # one workflow run, so a broad pattern pulls in results from other suites and
+            # tonumber then dies on a foreign id -- which is exactly how this failed.
+            [ .[] | select(.id | test("^D[0-9]+$")) | { id: .id, name: ($d[0][.id][0] // .id), detail: ($d[0][.id][1] // ""), status: .status, reason: (.reason // "") } ]
+            | sort_by(.id | ltrimstr("D") | tonumber)
+          ' ./results/result-*.json)
+          echo "$RESULTS" | jq -e 'length > 0' >/dev/null || { echo "::error::no discover results collected"; exit 1; }
+          echo "collected $(echo "$RESULTS" | jq 'length') results"
           echo "results=$RESULTS" >> "$GITHUB_OUTPUT"

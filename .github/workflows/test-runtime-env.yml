@@ -1,0 +1,737 @@
+name: "Runtime Environment Tests"
+
+on:
+  workflow_call:
+    inputs:
+      expected_failures:
+        description: 'JSON array of test ids from .github/data/expected-failures.json. A listed test still runs and still reports FAIL; its job just does not fail the run.'
+        required: false
+        type: string
+        default: '[]'
+      expected_labels:
+        description: 'JSON object mapping a known-failure test id to its upstream issue, shown in the job name.'
+        required: false
+        type: string
+        default: '{}'
+      argus_ref:
+        description: 'Argus branch/tag to test'
+        required: false
+        type: string
+        default: 'main'
+    outputs:
+      results:
+        description: "JSON array of individual test results"
+        value: ${{ jobs.collect-results.outputs.results }}
+
+permissions:
+  contents: read
+  actions: read
+
+# ============================================================================
+# Tests that depend on what the HOST has, and on which image variant argus
+# chose -- neither of which a reusable-workflow test can reach.
+#
+# WHY THESE ARE NOT IN test-edge.yml
+# ----------------------------------
+# The container suites dispatch argus-run.yml, which calls
+# container-scan.yml@<ref>. That gets the branch's workflow YAML, but every
+# `uses:` inside that file stays pinned at its release tag -- including
+# setup-argus, which installs the SDK from its own checkout. So the SDK in a
+# dispatched run is 1.12.5 no matter which ref the suite is pointed at.
+# `.github/scripts/audit-ref-liveness.sh` reports 0 of 23 nested references
+# live on a branch.
+#
+# Every behaviour below lives in the Python: _sub_scanner_failed, the exit-code
+# contract, detect_image_platforms, the cache-architecture check. Testing them
+# through the reusable workflow would silently test 1.12.5 and report the
+# branch. So these check argus out at `argus_ref` and drive the CLI directly,
+# where the exit code is also visible -- a dispatched run collapses 1 and 2
+# into "failure", and 1 vs 2 is the entire point of the contract.
+#
+# EXPECTED RED, AND WHY THAT IS THE POINT
+# ---------------------------------------
+# N1, N3 and N5 encode the resolution of blockers raised on argus PR #427 that
+# are NOT yet fixed on the branch. They are expected red against
+# fix/container-scan-no-silent-pass at 4e2b481a. The reviewer's closing line was
+# "All 66 checks pass, so none of the four above is caught today" -- catching
+# them is this file's reason to exist. If one of these goes green without the
+# corresponding upstream change, the test is wrong, not argus.
+# ============================================================================
+
+jobs:
+  # --------------------------------------------------------------------------
+  # N1 + N2: the daemonless runner, asserted as a PAIR.
+  #
+  # argus ADR-039 splits "this sub-scanner was not asked for and cannot run
+  # here" from "this sub-scanner was explicitly requested and cannot run". Both
+  # halves have to hold at once, and getting either wrong is a real failure:
+  #
+  #   collapse them towards failure -> every default scan on a rootless or
+  #     hardened runner goes red, and teams turn the gate off;
+  #   collapse them towards success -> `--scanners exposure` on a host that
+  #     cannot run exposure exits 0, which is the silent pass PR #427 exists
+  #     to kill.
+  #
+  # One job asserts both so they cannot drift apart in separate files.
+  #
+  # HOW THE RUNTIME IS REMOVED. Not a mock: PATH is narrowed to a directory
+  # holding only trivy and grype, plus the system dirs that do not carry a
+  # container runtime. argus finds runtimes with shutil.which, so this is
+  # exactly what a rootless/hardened runner looks like to it. Verified in-step
+  # by asserting `which docker` fails before argus is invoked.
+  # --------------------------------------------------------------------------
+  n1-n2-daemonless:
+    name: "N1/N2: daemonless runner split"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N1') || contains(fromJSON(inputs.expected_failures || '[]'), 'N2') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      n1: ${{ steps.assert.outputs.n1 }}
+      n2: ${{ steps.assert.outputs.n2 }}
+      reason: ${{ steps.assert.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout argus
+        uses: actions/checkout@v4
+        with:
+          repository: huntridge-labs/argus
+          ref: ${{ inputs.argus_ref || 'main' }}
+          path: argus-checkout
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install argus from the ref under test
+        run: pip install --quiet ./argus-checkout
+
+      # The vulnerability databases are ~200MB and were downloaded fresh on
+      # every run. One of those downloads failed -- "Failed to activate
+      # downloaded database" -- grype exited 1, argus correctly treated a
+      # REQUESTED scanner as failed, and N1 reported it as blocker 1. Cache
+      # them per day so a run normally reuses yesterday's and the assertion
+      # stops depending on a 200MB download succeeding.
+      - name: Cache scanner databases
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/trivy
+          # Unique per run so every run saves, with a prefix restore so every
+          # run after the first starts from the previous one's databases.
+          key: scannerdb-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            scannerdb-${{ runner.os }}-
+
+      - name: Install trivy as a plain binary
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/scanbin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/scanbin" v0.74.0
+          "$HOME/scanbin/trivy" --version
+
+      # GRYPE IS A STUB, AND THAT IS NOT WHAT N1 IS ABOUT.
+      #
+      # The host ADR-039 protects is "trivy and grype installed as local
+      # binaries, no container runtime" (argus scan_image docstring). The
+      # degrade rule covers exposure and services only -- they report an
+      # absent precondition as {"skipped": ...}. A missing grype raises, and a
+      # default scan with no grype exits 2. That is argus being right, so grype
+      # has to be present for N1 to have a verdict.
+      #
+      # A real grype is not an option here: `grype db update` failed four
+      # retries with escalating backoff on this runner, systematic rather than
+      # flaky. An earlier version dropped grype instead, on the claim that this
+      # widened the assertion to three unavailable sub-scanners. It did not:
+      # grype is not degradable, so N1 could never pass.
+      #
+      # The stub answers argus's local-binary invocation
+      # (`grype <source>:<ref> -o json --file PATH`) with an empty, valid
+      # result and records each call, so the assertion can prove argus reached
+      # it. It says nothing about grype's findings; N1 does not ask about them.
+      - name: Install a grype stub
+        run: |
+          set -euo pipefail
+          cat > "$HOME/scanbin/grype" <<'STUB'
+          #!/bin/sh
+          echo "$*" >> "$HOME/grype-stub-calls.log"
+          case "$1" in version|--version) echo "grype stub (argus-test N1)"; exit 0 ;; esac
+          out=""
+          while [ $# -gt 0 ]; do
+            if [ "$1" = "--file" ]; then out="$2"; shift; fi
+            shift
+          done
+          if [ -n "$out" ]; then echo '{"matches":[]}' > "$out"; else echo '{"matches":[]}'; fi
+          STUB
+          chmod +x "$HOME/scanbin/grype"
+          "$HOME/scanbin/grype" --version
+          rm -f "$HOME/grype-stub-calls.log"
+
+      # WARM THE DATABASES, WITH RETRIES. The preflight kept reporting "grype
+      # cannot complete a scan (database unavailable?)" and the test recorded
+      # no assurance -- correct, but useless. A ~200MB download that fails
+      # once is not a reason to have no verdict, so download it deliberately
+      # and retry, instead of hoping the first scan happens to succeed.
+      - name: Warm the scanner databases
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/scanbin:$PATH"
+          ok_trivy=false
+          for i in 1 2 3 4; do
+            if trivy image --download-db-only; then ok_trivy=true; break; fi
+            echo "::warning::trivy db download attempt $i failed"; sleep $((i * 20))
+          done
+          echo "trivy db ready: $ok_trivy"
+          # Stop the scans re-fetching once the databases are in place; a
+          # mid-scan refresh is what made this flaky in the first place.
+          echo "TRIVY_SKIP_DB_UPDATE=true" >> "$GITHUB_ENV"
+
+      - name: Assert both halves of the split
+        id: assert
+        env:
+          IMAGE: alpine:3.18
+        run: |
+          set -uo pipefail
+
+          # A PATH with the scanners and the interpreter, but no runtime.
+          #
+          # The previous version listed /usr/bin outright, on the stated
+          # assumption that none of the system dirs carries a container
+          # runtime. docker is /usr/bin/docker on a GitHub runner, so the
+          # assumption was simply false and this job failed its own
+          # precondition check on every run -- correctly refusing to pretend it
+          # had tested a daemonless host, while reporting it as an argus
+          # failure.
+          #
+          # Build the directory instead: symlink everything the system dirs
+          # offer EXCEPT the runtimes, so argus keeps python, curl and the rest
+          # and finds no runtime however it looks.
+          PYBIN="$(dirname "$(command -v python3)")"
+          SHIM="$HOME/norc"
+          rm -rf "$SHIM" && mkdir -p "$SHIM"
+          for d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              b=$(basename "$f")
+              case "$b" in
+                docker|podman|nerdctl|docker-*|podman-*|containerd*|ctr|crictl|lima*|colima) continue ;;
+              esac
+              [ -e "$SHIM/$b" ] || ln -s "$f" "$SHIM/$b" 2>/dev/null || true
+            done
+          done
+          export PATH="$HOME/scanbin:$PYBIN:$SHIM"
+          # Docker also answers over DOCKER_HOST; unset so a socket cannot
+          # rescue a runtime that PATH no longer advertises.
+          unset DOCKER_HOST
+
+          echo "--- host shape ---"
+          for rt in docker podman nerdctl; do
+            if command -v "$rt" >/dev/null 2>&1; then
+              echo "::error::$rt is still on PATH -- this test asserts behaviour on a host WITHOUT a container runtime, so it would prove nothing. PATH=$PATH"
+              exit 1
+            fi
+            echo "  $rt: absent (as required)"
+          done
+          echo "  trivy: $(command -v trivy)"
+          echo "  grype: $(command -v grype) (stub)"
+
+          # PREFLIGHT. N1 asserts that sub-scanners the caller did NOT ask for
+          # cannot fail the scan. That only means anything if at least one that
+          # CAN run does: with no working scanner at all, argus exiting
+          # non-zero is correct and N1 would be reporting a broken download as
+          # an argus defect. It did exactly that once.
+          PRE_OK=true
+          if ! trivy --version >/dev/null 2>&1; then
+            echo "::warning::trivy is not runnable"; PRE_OK=false
+          fi
+          # A real scan of a tiny image is the only honest check that the
+          # database is usable; --version says nothing about it.
+          if [ "$PRE_OK" = "true" ]; then
+            if ! trivy image --quiet --scanners vuln --format json alpine:3.18 >/dev/null 2>&1; then
+              echo "::warning::trivy cannot complete a scan (database unavailable?)"; PRE_OK=false
+            fi
+          fi
+          if [ "$PRE_OK" != "true" ]; then
+            echo "::warning title=N1/N2 preconditions unmet::A requested scanner cannot run on this host -- usually a vulnerability-database download that failed. argus exiting non-zero would then be correct, so this test cannot distinguish that from the behaviour it is asserting. Recorded as no assurance."
+            {
+              echo "n1=skip"
+              echo "n2=skip"
+              echo "reason=trivy could not complete a scan on this runner, usually a failed vulnerability-database download. With no working scanner, argus refusing the scan is correct, so this test could not isolate the behaviour it asserts."
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "  preflight: trivy completes a real scan"
+
+          N1=FAIL
+          N2=FAIL
+
+          # ---- N1: default selection must still pass -----------------------
+          # No --scanners, so exposure and services are in the default set and
+          # cannot run here. They were not asked for, so a clean image must
+          # still exit 0 -- and the sub-scanners that could not run must be
+          # NAMED, because a degradation nobody can see is a silent pass with
+          # extra steps.
+          echo "=== N1: default scan on a daemonless host ==="
+          set +e
+          python -m argus scan container --image "$IMAGE" --severity-threshold none > n1.log 2>&1
+          N1_RC=$?
+          set -e
+          tail -40 n1.log
+
+          if [ ! -s "$HOME/grype-stub-calls.log" ]; then
+            # Without this, a pass could mean argus never reached grype at
+            # all, and the host shape N1 claims to test was never exercised.
+            echo "::error title=N1::argus never invoked grype, so this was not the trivy-and-grype daemonless host N1 describes. The result says nothing about ADR-039."
+          elif [ "$N1_RC" -ne 0 ]; then
+            echo "::error title=N1::A default container scan exited $N1_RC on a host where trivy and grype work and exposure and services cannot run. Sub-scanners the caller never asked for must not fail the scan (ADR-039): a rootless or hardened runner would fail every scan and the gate would be switched off. Expected 0."
+          elif ! grep -qiE '(exposure|services)' n1.log; then
+            echo "::error title=N1::The scan exited 0, but neither 'exposure' nor 'services' is named in the output. They could not run here, and a reduced scan that does not say so is indistinguishable from a full one."
+          else
+            echo "PASS N1: exit 0, and the sub-scanners that could not run are named"
+            N1=pass
+          fi
+
+          # ---- N2: an explicit request that cannot run must fail ------------
+          echo "=== N2: --scanners exposure on the same host ==="
+          set +e
+          python -m argus scan container --image "$IMAGE" --scanners exposure --severity-threshold none > n2.log 2>&1
+          N2_RC=$?
+          set -e
+          tail -40 n2.log
+
+          if [ "$N2_RC" -eq 0 ]; then
+            echo "::error title=N2::'--scanners exposure' exited 0 on a host that cannot run exposure. Nothing was scanned and the gate reported success -- the exact silent pass argus PR #427 exists to close. Expected non-zero (2 per the exit-code contract)."
+          else
+            echo "PASS N2: explicitly-requested sub-scanner that cannot run exits $N2_RC"
+            N2=pass
+          fi
+
+          echo "n1=$N1" >> "$GITHUB_OUTPUT"
+          echo "n2=$N2" >> "$GITHUB_OUTPUT"
+
+          [ "$N1" = "pass" ] && [ "$N2" = "pass" ]
+
+  # --------------------------------------------------------------------------
+  # N3: the exit-code contract for "nothing could be scanned". Retires GAP-3.
+  #
+  # GAP-3 read "Blocked on a decision in argus". PR #427 makes the decision:
+  #   0 = every requested sub-scanner ran, nothing at or above the threshold
+  #   1 = findings at or above the threshold
+  #   2 = the scan could not be completed
+  # so the gap becomes a test. Asserting 2 specifically, not merely non-zero:
+  # 1 and 2 are both non-zero and mean opposite things to a caller, and this is
+  # the only place in the suite where the distinction is observable at all.
+  # --------------------------------------------------------------------------
+  n3-unscannable-exit-code:
+    name: "N3: unscannable image exits 2${{ fromJSON(inputs.expected_labels || '{}')['N3'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N3']) || '' }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N3') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # N3 can fail two ways that mean different things (failure-classes.json):
+    # exit 0 is fail-open -- nothing scanned, caller sees a pass; exit 1 still
+    # stops the pipeline, so it is fail-closed. The step says which.
+    # The step records its own verdict: when this job may fail without failing
+    # the run (continue-on-error), the job's result is not a reliable signal.
+    outputs:
+      class: ${{ steps.n3.outputs.class }}
+      verdict: ${{ steps.n3.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: huntridge-labs/argus
+          ref: ${{ inputs.argus_ref || 'main' }}
+          path: argus-checkout
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet ./argus-checkout
+      - name: Install trivy
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/scanbin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/scanbin" v0.74.0
+          echo "$HOME/scanbin" >> "$GITHUB_PATH"
+
+      - name: An image that cannot be pulled must exit 2, never 0
+        id: n3
+        run: |
+          set -uo pipefail
+          set +e
+          python -m argus scan container \
+            --image ghcr.io/huntridge-labs/no-such-image-exists:v0 \
+            --scanners trivy --severity-threshold none > n3.log 2>&1
+          RC=$?
+          set -e
+          tail -30 n3.log
+          case "$RC" in
+            2) echo "verdict=pass" >> "$GITHUB_OUTPUT"
+               echo "PASS N3: unscannable image exited 2 as the contract requires" ;;
+            0) echo "class=open" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::An unpullable image exited 0. Nothing was scanned and the caller sees a pass -- 'nothing could be scanned' is never 0."; exit 1 ;;
+            1) echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::An unpullable image exited 1, which means 'findings at or above the threshold'. A caller distinguishing a failing gate from a broken scan would read this as real findings. Expected 2."; exit 1 ;;
+            *) echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+               echo "::error title=N3::Expected exit 2, got $RC."; exit 1 ;;
+          esac
+
+  # --------------------------------------------------------------------------
+  # N4: a retry must name a platform the manifest actually publishes.
+  #
+  # pull_image used to retry every failed pull with a hardcoded
+  # --platform linux/amd64. For an arm64-only image that is a guaranteed second
+  # failure, and for every unrelated failure it burns a second full pull.
+  # PR #427 reads the published platforms from the manifest instead.
+  #
+  # Asserted on the CHOICE, not just the outcome: a scan can succeed for
+  # reasons unrelated to the retry, and "which platform did it ask for" is the
+  # thing that regressed.
+  #
+  # THE FIRST VERSION OF THIS TEST PASSED VACUOUSLY, which is worth recording
+  # because it is the suite's own failure mode. It ran `--scanners trivy`, and
+  # trivy reads a remote registry directly without ever asking the runtime to
+  # pull -- so no pull was attempted, nothing was asserted, and the job went
+  # green. Two changes:
+  #
+  #   1. `exposure` is requested, because it needs a real local image and
+  #      therefore forces the pull path this test is about;
+  #   2. if no pull is attempted anyway, the result is SKIP, not pass. A test
+  #      that could not reach its subject has produced no assurance, and the
+  #      dashboard grades skip as exactly that. Reporting pass would be the
+  #      same lie the suite exists to catch.
+  # --------------------------------------------------------------------------
+  n4-retry-platform:
+    name: "N4: retry names a published platform${{ fromJSON(inputs.expected_labels || '{}')['N4'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N4']) || '' }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N4') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      verdict: ${{ steps.assert.outputs.verdict }}
+      reason: ${{ steps.assert.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: huntridge-labs/argus
+          ref: ${{ inputs.argus_ref || 'main' }}
+          path: argus-checkout
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet ./argus-checkout
+      # N3 and N5 install a scanner; N4 did not, so argus had no binary to
+      # dispatch to, produced no output at all, and never reached the pull
+      # path -- which the escape hatch then reported as "could not reach its
+      # subject". The missing precondition was the whole cause.
+      - name: Install trivy
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/scanbin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/scanbin" v0.74.0
+          echo "$HOME/scanbin" >> "$GITHUB_PATH"
+
+      - name: No pull retry may hardcode linux/amd64
+        id: assert
+        run: |
+          set -uo pipefail
+
+          # Behavioural, not a grep over the source: drive the real pull path
+          # with a runtime whose every `pull` fails, and record the argv it was
+          # given. A source scan would miss a fallback assembled at runtime, and
+          # that assertion-on-structure blind spot is what let this ship.
+          mkdir -p "$HOME/fakebin"
+          # The stub used to succeed for everything except `pull`, so argus's
+          # "is this image already local?" probe -- docker image inspect --
+          # returned 0, argus concluded no pull was needed, and the retry path
+          # this test exists to observe was never reached. It reported skip and
+          # I blamed the CLI. The image must look ABSENT for a pull to happen.
+          cat > "$HOME/fakebin/docker" <<'SH'
+          #!/usr/bin/env bash
+          echo "$@" >> "${PULL_LOG:-/tmp/pull-argv.log}"
+          case "$1" in
+            pull)
+              echo "no matching manifest for the requested platform" >&2; exit 1 ;;
+            inspect)
+              echo "Error: No such object" >&2; exit 1 ;;
+            image)
+              # `image inspect` must fail; `image ls` returns nothing.
+              case "${2:-}" in
+                inspect) echo "Error: No such image" >&2; exit 1 ;;
+                *)       exit 0 ;;
+              esac ;;
+            images)
+              exit 0 ;;                      # empty listing: nothing cached
+            manifest)
+              # No manifest data, so a platform-aware retry must decide without it.
+              echo "no such manifest" >&2; exit 1 ;;
+            *)
+              exit 0 ;;                      # version/info: the runtime exists
+          esac
+          SH
+          chmod +x "$HOME/fakebin/docker"
+          export PATH="$HOME/fakebin:$PATH"
+          export PULL_LOG="$PWD/pull-argv.log"
+          : > "$PULL_LOG"
+
+          # `exposure` needs the image locally, so it drives the runtime pull
+          # path. trivy alone reads the registry directly and never pulls,
+          # which is how the first version of this test passed without
+          # asserting anything.
+          set +e
+          python -m argus scan container \
+            --image arm64v8/alpine:3.18 \
+            --scanners exposure,trivy --severity-threshold none > n4.log 2>&1
+          set -e
+
+          echo "--- pull invocations ---"
+          cat "$PULL_LOG" || true
+          echo "--- argus output (tail) ---"
+          tail -30 n4.log || true
+
+          # If the CLI still did not reach the pull path, call the pull
+          # function itself. Driving it through a whole scan adds dispatch,
+          # config and sub-scanner selection as failure modes without adding
+          # any assurance about THIS question, which is only ever "which
+          # platform did the retry ask for". Two attempts to reach it through
+          # the CLI produced a skip; the function is the subject, so call it.
+          if ! grep -q "pull" "$PULL_LOG"; then
+            echo "CLI path attempted no pull; driving the pull function directly."
+            : > "$PULL_LOG"
+            set +e
+            # The exit code is not the signal: the probe reports NO_PULL_FUNCTION
+            # in its output, and what matters is whether the stub logged a pull.
+            python3 .github/scripts/n4-probe-pull.py > n4-direct.log 2>&1 || true
+            set -e
+            cat n4-direct.log || true
+            if grep -q "NO_PULL_FUNCTION" n4-direct.log 2>/dev/null; then
+              echo "::warning title=N4 could not reach its subject::argus at this ref exposes no pull_image entry point under any known name, so there is no retry to inspect."
+              echo "verdict=skip" >> "$GITHUB_OUTPUT"
+              echo "reason=argus at this ref exposes no pull_image function under any name this test knows, so the retry platform could not be observed." >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "--- pull invocations (direct) ---"
+            cat "$PULL_LOG" || true
+          fi
+
+          if ! grep -q "pull" "$PULL_LOG"; then
+            echo "::warning title=N4 could not reach its subject::Neither the CLI nor a direct call produced a runtime pull, so there was no retry to inspect."
+            echo "verdict=skip" >> "$GITHUB_OUTPUT"
+            echo "reason=Neither a full scan nor a direct call to the pull function produced a runtime pull, so the retry platform could not be observed." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # arm64v8/alpine:3.18 publishes linux/arm64 and nothing else. Asking
+          # for linux/amd64 cannot succeed and proves the platform was assumed
+          # rather than read.
+          if grep -q -- "--platform linux/amd64" "$PULL_LOG"; then
+            echo "::error title=N4::A pull retry asked for --platform linux/amd64 against arm64v8/alpine:3.18, which publishes only linux/arm64. The platform was hardcoded, not read from the manifest: the retry cannot succeed and costs a second full pull. argus/core/engine.py still contained this fallback at 4e2b481a."
+            echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "PASS N4: a pull was attempted and no retry hardcoded linux/amd64"
+          echo "verdict=pass" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  # N5: a locally-built, never-pushed image under an explicit platform pin.
+  #
+  # This is also the air-gapped / `docker load` shape: the image exists only in
+  # the local cache and no registry can be consulted. PR #427's cache-
+  # architecture check falls through to a registry pull that cannot succeed
+  # (blocker 3), so this is expected red until that is fixed.
+  #
+  # Asserting on the WARNING TEXT, not just the exit code. The point of the
+  # substitution is that it is loud: findings that describe a different
+  # architecture than the one requested are still useful, but only if the
+  # report says which architecture it actually looked at. A silent substitution
+  # is a scan of something the caller did not ask about, reported as if it were.
+  # --------------------------------------------------------------------------
+  n5-local-image-platform-pin:
+    name: "N5: local image with a platform pin${{ fromJSON(inputs.expected_labels || '{}')['N5'] && format(' [known: {0}]', fromJSON(inputs.expected_labels || '{}')['N5']) || '' }}"
+    # A test listed in expected-failures.json (a known argus bug) still runs and
+    # still reports FAIL; it just does not fail the run. The summary goes red if
+    # a listed test starts passing, so the list cannot go stale.
+    continue-on-error: ${{ contains(fromJSON(inputs.expected_failures || '[]'), 'N5') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Three ways to fail, three classes: a non-zero exit stops the pipeline
+    # (fail-closed); exit 0 with no mention of a platform is a scan of the wrong
+    # architecture reported as a pass (fail-open); a warning that never names
+    # the variant scanned tells the reader something was substituted but not
+    # what, while the scan itself is fine (auxiliary).
+    outputs:
+      verdict: ${{ steps.assert5.outputs.verdict }}
+      reason: ${{ steps.assert5.outputs.reason }}
+      class: ${{ steps.assert5.outputs.class }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: huntridge-labs/argus
+          ref: ${{ inputs.argus_ref || 'main' }}
+          path: argus-checkout
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet ./argus-checkout
+      - name: Install trivy
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/scanbin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/scanbin" v0.74.0
+          echo "$HOME/scanbin" >> "$GITHUB_PATH"
+
+      - name: Build an image that exists only in the local cache
+        run: |
+          set -euo pipefail
+          # No registry, no push, and a name no registry could resolve. A
+          # genuine local-only image rather than a mock of one.
+          docker build -t argus-test-local-only:v0 -f tests/dockerfiles/good/Dockerfile tests/dockerfiles/good
+          docker image inspect argus-test-local-only:v0 --format 'built {{.Id}} for {{.Architecture}}'
+
+      - name: Scan it with containers.platform pinned to the other architecture
+        id: assert5
+        run: |
+          set -uo pipefail
+          HOST_ARCH=$(docker image inspect argus-test-local-only:v0 --format '{{.Architecture}}')
+          OTHER=$([ "$HOST_ARCH" = "amd64" ] && echo arm64 || echo amd64)
+          echo "local image is linux/$HOST_ARCH; pinning --platform linux/$OTHER"
+
+          # CONTROL FIRST. The assertion below blames argus for failing to scan
+          # a local-only image under a foreign platform pin. That is only a
+          # finding if argus CAN scan the same image without the pin --
+          # otherwise the test has proved that its own fixture is unscannable.
+          # An earlier run failed here with "could not determine source", which
+          # is exactly as consistent with a broken fixture as with the bug, and
+          # there was no way to tell them apart.
+          set +e
+          python -m argus scan container \
+            --image argus-test-local-only:v0 \
+            --scanners trivy --severity-threshold none > n5-control.log 2>&1
+          CTRL=$?
+          set -e
+          if [ "$CTRL" -ne 0 ]; then
+            tail -20 n5-control.log
+            echo "::warning title=N5 control failed::argus cannot scan this locally-built image even WITHOUT a platform pin (exit $CTRL), so the pinned case proves nothing about platform handling. Recorded as no assurance rather than as an argus finding."
+            echo "verdict=skip" >> "$GITHUB_OUTPUT"
+            echo "reason=The control failed: argus could not scan the locally-built image without any platform pin either, so this test could not isolate platform handling. The fixture or the local-image path is the problem, not necessarily the pin." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "control ok: the local image scans without a pin"
+
+          set +e
+          python -m argus scan container \
+            --image argus-test-local-only:v0 \
+            --platform "linux/$OTHER" \
+            --scanners trivy --severity-threshold none > n5.log 2>&1
+          RC=$?
+          set -e
+          tail -40 n5.log
+
+          if [ "$RC" -ne 0 ]; then
+            echo "class=closed" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+            echo "::error title=N5::Scanning a locally-built, never-pushed image with --platform linux/$OTHER exited $RC. The requested variant is not in the cache and no registry can be consulted, so argus must fall back to the cached variant and say so -- not attempt a registry pull that cannot succeed. This is the air-gapped and docker-load shape."
+            exit 1
+          fi
+
+          # The cached variant is linux/$HOST_ARCH, not the linux/$OTHER that
+          # was asked for. The report has to name what it actually looked at.
+          if ! grep -qiE "(platform|architecture|arch)" n5.log; then
+            echo "class=open" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+            echo "::error title=N5::The scan exited 0 but never mentions a platform or architecture. It scanned the cached linux/$HOST_ARCH variant while the caller asked for linux/$OTHER; a substitution nobody is told about is a scan of the wrong thing reported as the right thing."
+            exit 1
+          fi
+          if ! grep -qiE "$HOST_ARCH" n5.log; then
+            echo "class=auxiliary" >> "$GITHUB_OUTPUT"; echo "verdict=FAIL" >> "$GITHUB_OUTPUT"
+            echo "::error title=N5::The output mentions a platform but never names linux/$HOST_ARCH, the variant actually scanned. The warning has to say which architecture the findings describe, not merely that a substitution happened."
+            exit 1
+          fi
+          echo "PASS N5: fell back to the cached linux/$HOST_ARCH variant and named it"
+          echo "verdict=pass" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------------------
+  collect-results:
+    name: "Collect Runtime Environment Results"
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - n1-n2-daemonless
+      - n3-unscannable-exit-code
+      - n4-retry-platform
+      - n5-local-image-platform-pin
+    outputs:
+      results: ${{ steps.collect.outputs.results }}
+    steps:
+      - name: Build results JSON
+        id: collect
+        env:
+          # N1 and N2 share a job, so the job's own result cannot speak for
+          # both. The step publishes each half; fall back to the job result if
+          # the job died before the assertions ran.
+          PAIR_RESULT: ${{ needs.n1-n2-daemonless.result }}
+          N1_RAW: ${{ needs.n1-n2-daemonless.outputs.n1 }}
+          N2_RAW: ${{ needs.n1-n2-daemonless.outputs.n2 }}
+          PAIR_WHY: ${{ needs.n1-n2-daemonless.outputs.reason }}
+          N3: ${{ needs.n3-unscannable-exit-code.result }}
+          N3_CLASS: ${{ needs.n3-unscannable-exit-code.outputs.class }}
+          N3_RAW: ${{ needs.n3-unscannable-exit-code.outputs.verdict }}
+          N4: ${{ needs.n4-retry-platform.result }}
+          N4_RAW: ${{ needs.n4-retry-platform.outputs.verdict }}
+          N4_WHY: ${{ needs.n4-retry-platform.outputs.reason }}
+          N5: ${{ needs.n5-local-image-platform-pin.result }}
+          N5_RAW: ${{ needs.n5-local-image-platform-pin.outputs.verdict }}
+          N5_WHY: ${{ needs.n5-local-image-platform-pin.outputs.reason }}
+          N5_CLASS: ${{ needs.n5-local-image-platform-pin.outputs.class }}
+        run: |
+          to_status() {
+            case "$1" in
+              success) echo "pass" ;;
+              failure) echo "FAIL" ;;
+              skipped) echo "skip" ;;
+              cancelled) echo "cancel" ;;
+              *) echo "unknown" ;;
+            esac
+          }
+          half() {
+            # $1 = the step's own verdict, $2 = the enclosing job's result.
+            # A step that reports 'skip' could not reach its subject; that is
+            # no assurance, and the dashboard grades it as such. It must not be
+            # flattened into the job's 'success'.
+            case "$1" in
+              pass) echo "pass" ;;
+              FAIL) echo "FAIL" ;;
+              skip) echo "skip" ;;
+              *)    to_status "$2" ;;
+            esac
+          }
+          RESULTS=$(jq -n -c \
+            --arg n1 "$(half "$N1_RAW" "$PAIR_RESULT")" \
+            --arg n2 "$(half "$N2_RAW" "$PAIR_RESULT")" \
+            --arg pairwhy "$PAIR_WHY" \
+            --arg n3 "$(half "$N3_RAW" "$N3")" \
+            --arg n4 "$(half "$N4_RAW" "$N4")" \
+            --arg n4why "$N4_WHY" \
+            --arg n5 "$(half "$N5_RAW" "$N5")" \
+            --arg n5why "$N5_WHY" \
+            --arg n3class "$N3_CLASS" \
+            --arg n5class "$N5_CLASS" \
+            '[
+              {"id":"N1","name":"daemonless default scan","detail":"Does a default container scan still exit 0 when only some of the default sub-scanners can run here, naming the ones that could not?","status":$n1,"reason":$pairwhy},
+              {"id":"N2","name":"daemonless explicit request","detail":"Does an explicitly requested sub-scanner that cannot run on this host exit non-zero rather than reporting success?","status":$n2,"reason":$pairwhy},
+              {"id":"N3","name":"unscannable image exit code","detail":"Does argus exit 2, distinct from 1, when an image cannot be pulled and nothing could be scanned?","status":$n3,"class":$n3class},
+              {"id":"N4","name":"retry platform is published","detail":"Does a failed pull retry against a platform the manifest publishes rather than hardcoding linux/amd64?","status":$n4,"reason":$n4why},
+              {"id":"N5","name":"local image platform pin","detail":"Does a locally-built never-pushed image scan under an explicit platform pin, naming which architecture the findings describe?","status":$n5,"reason":$n5why,"class":$n5class}
+            ]')
+          echo "results=$RESULTS" >> "$GITHUB_OUTPUT"

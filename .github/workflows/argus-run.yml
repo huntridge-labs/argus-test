@@ -1,0 +1,245 @@
+name: "argus run (dispatch target)"
+run-name: "argus ${{ inputs.marker }}"
+
+# ============================================================================
+# Dispatch target: one argus invocation, in its own run.
+#
+# WHY THIS EXISTS
+# ---------------
+# Calling container-scan.yml with `uses:` pulls argus's whole job graph into
+# the caller's run, so argus's Discover / Build & Scan / Scan Remote Image /
+# Container Scan Summary jobs all surface as checks on our pull requests. That
+# has two consequences a test suite should not accept:
+#
+#   - A test that asserts argus BLOCKS needs argus to exit non-zero, and that
+#     exit renders red on the PR. Red then means "the test passed", which no
+#     reader can be expected to know.
+#   - argus branches internally on scan_mode, so every test contributes two or
+#     three skipped jobs that say nothing about the test. 81 tests produced 298
+#     checks, 127 of them skips.
+#
+# A workflow_dispatch run does NOT create check runs on a pull request --
+# verified on the exact SHA of PR #17, which reported no checks. So a test can
+# dispatch this, wait, read the conclusion, and assert on it. The test job is
+# then green exactly when its assertion holds, and argus's jobs stay in their
+# own run.
+#
+# `marker` is echoed into run-name because the dispatch API returns no run id;
+# the caller finds its child by matching this string.
+#
+# WHY ONE JOB PER REF
+# -------------------
+# `uses:` is resolved when the workflow is parsed, before inputs exist, so
+# `@${{ inputs.argus_ref }}` is not expressible. Each testable ref therefore
+# needs its own literal job, selected by `if:`. The enumeration lives in
+# .github/data/argus-refs.json and I4 fails if this file drifts from it.
+#
+# Defaulting an unknown ref to main is exactly the silent substitution this
+# suite exists to catch, so `guard-ref` fails instead. argus-scan also refuses
+# client-side, which produces the better error message; the guard is here so a
+# hand-run dispatch cannot slip past.
+#
+# NOTE ON WHAT A BRANCH RUN ACTUALLY TESTS
+# ----------------------------------------
+# Referencing container-scan.yml at a branch gets you that branch's workflow
+# YAML, but every `uses:` inside it stays pinned at its release tag -- including
+# setup-argus, which installs the SDK from its OWN checkout. So a branch run
+# executes branch YAML against the RELEASED SDK. See
+# .github/scripts/audit-ref-liveness.sh; the dashboard prints the split next to
+# the ref. SDK-level behaviour is covered by test-runtime-env.yml,
+# test-actions-direct.yml and test-unit.yml, which check argus out at the ref.
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      marker:
+        description: 'Unique token so the dispatching job can find this run'
+        required: true
+        type: string
+      argus_ref:
+        description: 'argus ref to call. Must be listed in .github/data/argus-refs.json.'
+        required: false
+        type: string
+        default: 'main'
+      scan_mode:
+        required: false
+        type: string
+        default: 'remote'
+      image_ref:
+        required: false
+        type: string
+        default: ''
+      container_name:
+        required: false
+        type: string
+        default: ''
+      registry_username:
+        required: false
+        type: string
+        default: ''
+      scanners:
+        required: false
+        type: string
+        default: 'trivy,grype,syft'
+      fail_on_severity:
+        required: false
+        type: string
+        default: 'none'
+      allow_failure:
+        required: false
+        type: boolean
+        default: false
+      # --- inputs added by argus PR #427 -------------------------------------
+      # Passing an input a workflow does not declare fails the call at startup
+      # with no job and no annotation. These were threaded only into a job
+      # pinned to #427's branch while it was under review; the branch merged on
+      # 2026-09-22 and main declares all three, so scan-main takes them now.
+      search_paths:
+        required: false
+        type: string
+        default: ''
+      platform:
+        required: false
+        type: string
+        default: ''
+      fail_on_no_targets:
+        required: false
+        type: boolean
+        default: false
+
+# Must be a superset of what container-scan.yml declares, or the call fails at
+# startup with no jobs and no annotation. argus requires pull-requests: write.
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: read
+  pull-requests: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Refuse an unenumerated ref rather than falling through to main.
+  # --------------------------------------------------------------------------
+  guard-ref:
+    name: "guard: argus_ref is enumerated"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          ARGUS_REF: ${{ inputs.argus_ref }}
+        run: |
+          set -euo pipefail
+          KNOWN=$(jq -r '.refs[].ref' .github/data/argus-refs.json)
+          if ! grep -Fxq "$ARGUS_REF" <<<"$KNOWN"; then
+            echo "::error title=Unenumerated argus_ref::'$ARGUS_REF' is not in .github/data/argus-refs.json. A ref that is not enumerated has no job in this file, so the scan would be SKIPPED and this run would still conclude 'success' -- reporting a pass for a ref nothing ran against. Add it to argus-refs.json and add a matching job to every dispatch target."
+            exit 1
+          fi
+          echo "argus_ref '$ARGUS_REF' is enumerated."
+
+  # --------------------------------------------------------------------------
+  # One job per enumerated ref. Exactly one runs.
+  # --------------------------------------------------------------------------
+  scan-main:
+    name: "scan (argus@main)"
+    needs: guard-ref
+    if: inputs.argus_ref == 'main'
+    uses: huntridge-labs/argus/.github/workflows/container-scan.yml@main
+    with:
+      scan_mode: ${{ inputs.scan_mode }}
+      image_ref: ${{ inputs.image_ref }}
+      container_name: ${{ inputs.container_name }}
+      registry_username: ${{ inputs.registry_username }}
+      scanners: ${{ inputs.scanners }}
+      fail_on_severity: ${{ inputs.fail_on_severity }}
+      allow_failure: ${{ inputs.allow_failure }}
+      post_pr_comment: false
+      search_paths: ${{ inputs.search_paths }}
+      platform: ${{ inputs.platform }}
+      fail_on_no_targets: ${{ inputs.fail_on_no_targets }}
+
+  # --------------------------------------------------------------------------
+  # Publish the called workflow's outputs so the dispatching test can assert on
+  # them. This is what closes GAP-2: before this, a caller could observe only
+  # the run's conclusion, which cannot distinguish "clean" from "never ran".
+  #
+  # main declares all nine since PR #427 merged. `declared` is kept because a
+  # ref added here later may not: on such a ref every field comes back empty,
+  # and the artifact records `declared: false` so a test asserting on outputs
+  # fails with "this ref does not declare them" rather than with a confusing
+  # empty-string comparison.
+  #
+  # `if: always()` because the interesting case is a FAILED scan whose
+  # overall_status and images_scanned are exactly what needs checking.
+  # --------------------------------------------------------------------------
+  publish-outputs:
+    name: "publish scan outputs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [guard-ref, scan-main]
+    if: always() && needs.guard-ref.result != 'failure'
+    steps:
+      - name: Collect the scan's outputs
+        env:
+          MAIN_RESULT: ${{ needs.scan-main.result }}
+          ARGUS_REF: ${{ inputs.argus_ref }}
+          CRITICAL: ${{ needs.scan-main.outputs.critical_count }}
+          HIGH: ${{ needs.scan-main.outputs.high_count }}
+          MEDIUM: ${{ needs.scan-main.outputs.medium_count }}
+          LOW: ${{ needs.scan-main.outputs.low_count }}
+          TOTAL: ${{ needs.scan-main.outputs.total_count }}
+          VULNS_FOUND: ${{ needs.scan-main.outputs.vulnerabilities_found }}
+          IMAGES_SCANNED: ${{ needs.scan-main.outputs.images_scanned }}
+          OVERALL_STATUS: ${{ needs.scan-main.outputs.overall_status }}
+          SCAN_STATUSES: ${{ needs.scan-main.outputs.scan_statuses }}
+        run: |
+          set -uo pipefail
+          RESULT="$MAIN_RESULT"
+
+          # "declared" distinguishes a ref that has no outputs from a scan that
+          # produced empty ones. Nine empty strings could mean either.
+          DECLARED=true
+          if [ -z "${IMAGES_SCANNED}${OVERALL_STATUS}${TOTAL}" ]; then
+            DECLARED=false
+          fi
+
+          jq -n \
+            --arg ref "$ARGUS_REF" \
+            --arg conclusion "$RESULT" \
+            --argjson declared "$DECLARED" \
+            --arg critical "$CRITICAL" \
+            --arg high "$HIGH" \
+            --arg medium "$MEDIUM" \
+            --arg low "$LOW" \
+            --arg total "$TOTAL" \
+            --arg vulnerabilities_found "$VULNS_FOUND" \
+            --arg images_scanned "$IMAGES_SCANNED" \
+            --arg overall_status "$OVERALL_STATUS" \
+            --arg scan_statuses "$SCAN_STATUSES" \
+            '{
+               argus_ref: $ref,
+               scan_conclusion: $conclusion,
+               declared: $declared,
+               outputs: {
+                 critical_count: $critical,
+                 high_count: $high,
+                 medium_count: $medium,
+                 low_count: $low,
+                 total_count: $total,
+                 vulnerabilities_found: $vulnerabilities_found,
+                 images_scanned: $images_scanned,
+                 overall_status: $overall_status,
+                 scan_statuses: $scan_statuses
+               }
+             }' > scan-outputs.json
+
+          echo "--- scan-outputs.json ---"
+          cat scan-outputs.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-outputs
+          path: scan-outputs.json
+          retention-days: 7
+          if-no-files-found: error
