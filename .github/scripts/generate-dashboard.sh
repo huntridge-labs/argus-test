@@ -1089,7 +1089,7 @@ __NAV_JS__
   $('rate-num').className = 'stat-num';
   $('rate-sub').textContent = nPass + '/' + tests.length;
   $('rate-break').innerHTML = '<b>' + nPass + '</b> passed \u00b7 <b>' + nFail + '</b> failed \u00b7 <b>' +
-    nIdle + '</b> not run \u2014 all ' + tests.length + ' defined tests count';
+    nIdle + '</b> not run';
 
   // The index's working, beside the sentence it qualifies: which tests produced
   // the number and what each cost. Named per test while that stays short; past
@@ -1171,7 +1171,11 @@ __NAV_JS__
   // One chip per class, in severity order, so a class added to
   // failure-classes.json appears without editing this list.
   const FILTER_KEY = { open: 'fail-open', closed: 'fail-closed' };
-  const STAT_DEFS = [{ key: 'not-run', cls: 'idle', label: 'not run', n: nIdle }].concat(
+  // What "not run" does to the numbers is the one thing a reader cannot see
+  // from the counts, so the chip says it: it lowers the pass rate (the test
+  // was not verified) but not the risk index (only failures score).
+  const STAT_DEFS = [{ key: 'not-run', cls: 'idle', label: 'not run', n: nIdle,
+    gloss: 'Defined but not run this time. Counts against the pass rate (it was not verified), not the risk index.' }].concat(
     ORDER.map(function (c) {
       return { key: FILTER_KEY[c] || c,
                cls: (c === 'auxiliary' ? 'warn' : 'fail'),
