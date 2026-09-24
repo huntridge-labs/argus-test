@@ -466,6 +466,13 @@ a:hover { border-bottom-color: var(--primary); }
   .hero-plots { grid-template-columns: 1fr; }
   .col2 { border-left: 0; }
   .plot-head.col2 { border-top: 1px solid var(--border); padding-top: 18px; }
+  /* One column: each chart directly under its own title. In source order both
+     heads come first (they share a row on desktop), which on a phone put
+     "Risk index" and "Pass rate" together above two unlabelled charts. */
+  .hero-plots > :nth-child(1) { order: 1; }
+  .hero-plots > :nth-child(3) { order: 2; }
+  .hero-plots > :nth-child(2) { order: 3; }
+  .hero-plots > :nth-child(4) { order: 4; }
 }
 .badge {
   font-size: 2.1rem; font-weight: 700; line-height: 1; padding: 12px 20px;
@@ -851,10 +858,19 @@ cat >> "$OUT/index.html" << 'HTMLEOF2'
 __NAV_JS__
 (function () {
   const d = DATA;
-  renderNav({ el: 'nav', branch: d.branchName || d.branchSlug || 'branch',
-              slug: d.branchSlug || d.branchName, page: 'tests',
-              branches: d.branches || [], up: '../' });
   const server = d.runUrl.split('/').slice(0, 3).join('/');
+  // The argus version under test: the release when the ref is main, the ref
+  // otherwise, and always the exact commit -- the link cannot move.
+  const aSha = d.argusSha && d.argusSha !== 'unknown' ? String(d.argusSha).slice(0, 7) : '';
+  const onMain = (d.argusRef || 'main') === 'main';
+  const aHref = d.argusRepo ? server + '/' + d.argusRepo +
+                (aSha ? '/commit/' + d.argusSha : '/tree/' + (d.argusRef || 'main')) : '';
+  renderNav({ el: 'nav', branch: d.branchName || d.branchSlug || 'branch',
+              slug: d.branchSlug || d.branchName, sha: d.selfSha, page: 'tests',
+              branches: d.branches || [], up: '../',
+              argus: d.argusRepo ? { version: onMain && d.argusVersion ? 'v' + d.argusVersion
+                                                    : (d.argusRef || 'main'),
+                                     sha: aSha, href: aHref } : null });
   const repoUrl = server + '/' + d.repo;
   const srcBase = repoUrl + '/blob/' + (d.selfSha || 'main') + '/';
 

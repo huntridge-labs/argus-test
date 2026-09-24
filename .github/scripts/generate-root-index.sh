@@ -304,7 +304,9 @@ splice_nav "$SITE_DIR/index.html"
 # The manifest a publishing branch reads to know what else to carry with it.
 # Pages replaces the whole site, so a branch missing from here gets deleted by
 # the next deploy until it runs again.
-jq -c 'map({slug: .branch, name: (.name // .branch)})' <<<"$CARDS" > "$SITE_DIR/branches.json"
+# sha: the branch's latest published suite commit, so the board's branch
+# picker can show each branch with its commit.
+jq -c 'map({slug: .branch, name: (.name // .branch), sha: (.latest.self_sha // null)})' <<<"$CARDS" > "$SITE_DIR/branches.json"
 echo "Wrote $SITE_DIR/branches.json: $(jq -r 'map(.slug) | join(", ")' "$SITE_DIR/branches.json")"
 
 echo "Root index written: $SITE_DIR/index.html ($COUNT branch card(s))"
