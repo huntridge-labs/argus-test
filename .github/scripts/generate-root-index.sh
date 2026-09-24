@@ -54,6 +54,7 @@ touch "$SITE_DIR/.nojekyll"
 # <first-branch>/favicon.png, which breaks the moment that branch stops
 # publishing.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/site-nav.sh"
 FAVICON_SRC="$SCRIPT_DIR/../data/argus-favicon.png"
 [ -f "$FAVICON_SRC" ] && cp "$FAVICON_SRC" "$SITE_DIR/favicon.png"
 
@@ -116,6 +117,7 @@ HTMLEOF
 cat >> "$SITE_DIR/index.html" << 'HTMLEOF2'
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Nunito+Sans:ital,wght@0,300;0,400;0,600;0,700&display=swap');
+__NAV_CSS__
 :root {
   --bg:#ffffff; --surface:#ffffff; --fg:#1a1a1a; --fg2:#55595c; --fg3:#919aa1;
   --border:#dee2e6; --rule:#ebedef;
@@ -137,8 +139,6 @@ body { font-family:"Nunito Sans",-apple-system,BlinkMacSystemFont,sans-serif;
 .wrap { max-width:860px; margin:0 auto; padding:52px 16px 64px; }
 a { color:inherit; }
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:0.92em; }
-h1 { font-size:1.1rem; font-weight:700; text-transform:uppercase; letter-spacing:0.11em;
-     color:var(--fg); margin:0 0 6px; display:flex; align-items:center; }
 /* Argus's eye beside the title. Grayscaled deliberately: it is a mark, not a
    status light, and the page already spends colour on severity -- a green eye
    next to a red risk number competes with the one signal that should carry it.
@@ -184,7 +184,7 @@ footer { margin-top:34px; padding-top:16px; border-top:1px solid var(--border);
 </head>
 <body>
 <div class="wrap">
-  <h1><img class="eye" src="favicon.png" alt="" aria-hidden="true">Argus Test Suite</h1>
+  <div class="nav" id="nav"></div>
   <p class="lede">Consumer-contract tests for
     <a href="https://github.com/huntridge-labs/argus">huntridge-labs/argus</a>,
     published per branch. Each branch keeps its own run history, so results from
@@ -201,6 +201,9 @@ HTMLEOF2
 } >> "$SITE_DIR/index.html"
 
 cat >> "$SITE_DIR/index.html" << 'HTMLEOF3'
+__NAV_JS__
+// The site root: the title and the theme, no branch or page.
+renderNav({ el: 'nav', root: '' });
 (function () {
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -295,6 +298,8 @@ cat >> "$SITE_DIR/index.html" << 'HTMLEOF3'
 </body>
 </html>
 HTMLEOF3
+
+splice_nav "$SITE_DIR/index.html"
 
 # The manifest a publishing branch reads to know what else to carry with it.
 # Pages replaces the whole site, so a branch missing from here gets deleted by

@@ -421,12 +421,6 @@ a:hover { border-bottom-color: var(--primary); }
 /* Lux signature: small, uppercase, widely tracked labels */
 .lbl { text-transform: uppercase; letter-spacing: var(--track); font-weight: 600; font-size: 0.7rem; color: var(--fg3); }
 
-header { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; margin-bottom: 30px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
-header h1 {
-  margin: 0; font-size: 1.05rem; font-weight: 700; color: var(--fg);
-  text-transform: uppercase; letter-spacing: 0.12em;
-  display: flex; align-items: center;
-}
 /* Argus's eye beside the title. Grayscaled deliberately: it is a mark, not a
    status light, and the page already spends colour on severity -- a green eye
    next to a red risk number competes with the one signal that should carry it.
@@ -758,22 +752,11 @@ tr[id], [id^="ref-"], [id^="cite-"], section[id] { scroll-margin-top: 92px; }
 @keyframes land { from { background: var(--warn-bg); } to { background: transparent; } }
 footer { margin-top: 44px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--fg3); }
 
-/* theme toggle */
-.theme-toggle {
-  background: transparent; border: 1px solid var(--border); border-radius: var(--radius);
-  color: var(--fg3); font: inherit; font-size: 0.64rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: var(--track); padding: 4px 9px; cursor: pointer;
-}
-.theme-toggle:hover { border-color: var(--primary); color: var(--fg); }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="nav" id="nav"></div>
-  <header>
-    <div class="phead" id="phead"></div>
-    <button class="theme-toggle" id="theme-toggle" type="button" title="Switch theme"></button>
-  </header>
   <div class="pmeta" id="head-meta"></div>
 
   <section class="card hero">
@@ -889,12 +872,9 @@ __NAV_JS__
 
   // ---------------------------------------------------------------- header
   var meta = [];
-  // One shared header for both pages -- same markup, same metadata, same type
-  // scale. They had grown separate ones weeks apart, and two pages a click
-  // apart should not look like two products. See site-nav.sh.
+  // The run's metadata line under the nav; renderHeader lives in site-nav.sh.
   renderHeader({
-    el: 'phead', metaEl: 'head-meta', title: 'Argus Test Suite', up: '__UP__',
-    branch: d.branchName || d.branchSlug,
+    metaEl: 'head-meta', up: '__UP__',
     selfRepo: d.repo, selfSha: d.selfSha,
     argusRepo: d.argusRepo, argusRef: d.argusRef,
     argusSha: d.argusSha, argusVersion: d.argusVersion,
@@ -1812,22 +1792,7 @@ __NAV_JS__
     'coverage gaps in <span class="mono">.github/data/coverage-gaps.json</span>; ' +
     '<a href="__UP__../">All branches</a>.</div>';
 
-  // Theme: follow the OS by default, let the reader override, remember it.
-  // Storage can throw in private windows, so every access is guarded.
-  const root = document.documentElement;
-  const tbtn = $('theme-toggle');
-  function readTheme() { try { return localStorage.getItem('argus-theme') || 'auto'; } catch (e) { return 'auto'; } }
-  function applyTheme(mode) {
-    if (mode === 'auto') root.removeAttribute('data-theme');
-    else root.setAttribute('data-theme', mode);
-    tbtn.textContent = mode === 'auto' ? 'Auto' : mode === 'dark' ? 'Night' : 'Day';
-    try { localStorage.setItem('argus-theme', mode); } catch (e) {}
-  }
-  applyTheme(readTheme());
-  tbtn.addEventListener('click', function () {
-    const order = ['auto', 'light', 'dark'];
-    applyTheme(order[(order.indexOf(readTheme()) + 1) % order.length]);
-  });
+  // The theme control lives in the nav (initTheme in site-nav.sh).
 
   // The URL carries the whole query, `is:` tokens included, so a filtered view
   // is a shareable link rather than something you have to re-click.
